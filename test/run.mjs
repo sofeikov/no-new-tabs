@@ -954,6 +954,146 @@ async function unreachedFrames() {
   report("opaque sandbox _blank click", !r.error && r.created === 0, `(created ${r.created})`);
 }
 
+// Issue 12: over-blocking on listed sites. The guard must not break pages
+// that hook window.open, switch targets back to _self, open into named
+// frames showing another site, reset frames with about:blank, or log
+// readable URLs. Needs the popup blocker off: some checks use window.open.
+async function overblocking() {
+  console.log("\n=== Over-blocking on listed sites (issue 12) ===");
+  // 1. A page's own window.open hook keeps its identity: bound, proxy and
+  // native-looking hooks are returned as-is, and blocked opens go through
+  // the hook (which blocks them itself here).
+  await rawLoad(`${LISTED}/index.html`);
+  let r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      window.__calls = [];
+      window.__ident = [];
+      const mine = function (u, t) { window.__calls.push([u, t]); return null; };
+      window.__bound = mine.bind(window);
+      window.__px = new Proxy(window.open, { apply(t, th, a) { window.__calls.push(["px", ...a]); return Reflect.apply(t, th, a); } });
+      const nc = function (u, t) { window.__calls.push(["nc", u, t]); return null; /* [native code] */ };
+      window.__nc = nc;
+      window.open = window.__bound;
+      window.__ident.push(window.open === window.__bound);
+    })()`);
+    await rp.click("#btn-open");
+    await rp.eval(`(() => {
+      window.open = window.__px;
+      window.__ident.push(window.open === window.__px);
+    })()`);
+    await rp.click("#btn-open");
+    await rp.eval(`(() => {
+      window.open = window.__nc;
+      window.__ident.push(window.open === window.__nc);
+      const mine = window.__bound;
+      for (let i = 0; i < 50 && window.open !== mine; i++) window.open = mine;
+      window.__settled = window.open === mine;
+    })()`);
+    await rp.click("#btn-open");
+  });
+  const hook = await rp.eval(`(() => ({
+    calls: window.__calls.length,
+    settled: !!window.__settled,
+    identity: window.__ident.every(Boolean),
+  }))()`);
+  report("page window.open hook keeps identity", !r.error && r.created === 0 && hook.calls >= 3 && hook.settled && hook.identity,
+    `(created ${r.created}, calls ${hook.calls}, settled ${hook.settled}, identity ${hook.identity})`);
+  // 2. A _blank link the page switches to _self navigates instead of dying.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      const a = document.createElement("a");
+      a.id = "h-self";
+      a.href = "/target.html?case=h-selflink";
+      a.target = "_blank";
+      a.textContent = "x";
+      document.body.append(a);
+      a.addEventListener("click", function () { this.target = "_self"; });
+    })()`);
+    await rp.click("#h-self");
+    await sleep(500);
+  });
+  report("late _self switch on link", !r.error && r.created === 0 && (await rp.url()).includes("h-selflink"),
+    `(created ${r.created}, url ${(await rp.url()).split("/").pop()})`);
+  // A _blank form the page switches to _self submits instead of dying.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      const f = document.createElement("form");
+      f.id = "h-selff";
+      f.action = "/target.html";
+      f.method = "get";
+      f.target = "_blank";
+      f.innerHTML = '<input type="hidden" name="case" value="h-selff"><button id="h-selfb" type="submit">go</button>';
+      document.body.append(f);
+      f.addEventListener("submit", function () { this.target = "_self"; });
+    })()`);
+    await rp.click("#h-selfb");
+    await sleep(500);
+  });
+  report("late _self switch on form", !r.error && r.created === 0 && (await rp.url()).includes("h-selff"),
+    `(created ${r.created}, url ${(await rp.url()).split("?")[0].split("/").pop()})`);
+  // 3. Opening into a named iframe that currently shows another site
+  // navigates the frame instead of dying.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      window.__frLoads = 0;
+      const f = document.createElement("iframe");
+      f.name = "h-fr";
+      f.src = "http://127.0.0.1:8799/target.html?case=h-cross1";
+      f.addEventListener("load", () => window.__frLoads++);
+      document.body.append(f);
+    })()`);
+    await sleep(800);
+    await rp.eval(`(() => {
+      const a = document.createElement("a");
+      a.id = "h-frgo";
+      a.href = "http://127.0.0.1:8799/target.html?case=h-cross2";
+      a.target = "h-fr";
+      a.textContent = "x";
+      document.body.append(a);
+    })()`);
+    await rp.click("#h-frgo");
+    await sleep(800);
+  });
+  const frLoads = await rp.eval(`window.__frLoads`);
+  report("named iframe showing another site", !r.error && r.created === 0 && frLoads >= 2,
+    `(created ${r.created}, frame loads ${frLoads})`);
+  // 4. window.open("about:blank", "<same-origin named iframe>") resets it.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      const f = document.createElement("iframe");
+      f.id = "h-ab";
+      f.name = "h-ab";
+      f.src = "/target.html?case=h-abhost";
+      document.body.append(f);
+      window.__f = f;
+    })()`);
+    await sleep(800);
+    await rp.eval(`(() => {
+      window.__hrefBefore = window.__f.contentWindow.location.href;
+      window.open("about:blank", "h-ab");
+    })()`);
+    await sleep(300);
+  });
+  const hrefs = await rp.eval(`({ before: window.__hrefBefore, after: window.__f.contentWindow.location.href })`);
+  report("about:blank resets named frame", !r.error && r.created === 0 && hrefs.after === "about:blank",
+    `(created ${r.created}, ${hrefs.before.split("/").pop()} -> ${hrefs.after.split("/").pop()})`);
+  // 5. The console log shows the resolved URL, not the raw attribute.
+  await rawLoad(`${LISTED}/index.html`);
+  const msgs = [];
+  raw.on("Runtime.consoleAPICalled", (p) => {
+    const t = (p.args ?? []).map((a) => a.value ?? "").join(" ");
+    if (t.includes("[no-new-tabs]")) msgs.push(t);
+  });
+  r = await rawCase(() => rp.click("#link-blank"));
+  const logged = msgs.filter((t) => t.includes("case=blank"));
+  report("console shows resolved URL", !r.error && r.created === 0 && logged.some((t) => t.includes("http://localhost:8799/target.html?case=blank")),
+    `(created ${r.created}, sample: ${(logged[0] ?? "none").slice(0, 90)})`);
+}
+
 // Adding a site arms an open page, hidden frames included, even before any
 // input (needs the popup blocker off for the frame to open anything).
 async function liveArmNoInput() {
@@ -1004,6 +1144,7 @@ try {
   await liveArmNoInput();
   await hardening();
   await unreachedFrames();
+  await overblocking();
 
   console.log("\n##### Background layer only (no content scripts) #####");
   const bgOnly = backgroundOnlyCopy();
