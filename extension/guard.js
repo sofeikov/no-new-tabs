@@ -99,11 +99,17 @@
   const submitterOf = (e) => { try { return submitterGet(e); } catch { return null; } };
   const buttonForm = getter(HTMLButtonElement.prototype, "form");
   const inputForm = getter(HTMLInputElement.prototype, "form");
+  const baseURI = getter(Node.prototype, "baseURI");
+  const URLC = URL;
   const iframeWindow = getter(HTMLIFrameElement.prototype, "contentWindow");
   const [winName, winLength, winOrigin, winFrameElement, winTop] =
     ["name", "length", "origin", "frameElement", "top"].map((k) => getter(window, k));
   const setTimer = setTimeout.bind(window);
   const [WeakMapC, WeakRefC] = [WeakMap, WeakRef];
+  // Every window.open the guard itself saw at install time, in any realm.
+  // The page can never obtain another copy of the native one: the guard is
+  // installed before page script runs and its wrappers report native source.
+  const nativeOpens = new WeakSet();
   // Index loops only from here on: for...of and spreading use iterators a
   // page can replace.
   const each = (list, fn) => { for (let i = 0; i < list.length; i++) fn(list[i]); };
@@ -189,17 +195,35 @@
     let root;
     try { root = isSandboxed(from) ? from : winTop(from); } catch { return false; }
     const stack = [root];
-    for (let seen = 0; stack.length && seen < 500; seen++) {
+    const seen = [];
+    for (let n = 0; stack.length && n < 500; n++) {
       const w = stack[stack.length - 1];
       stack.length--;
       try { if (winName(w) === name) return true; } catch {} // other origin: not counted
-      let n = 0;
-      try { n = winLength(w); } catch {}
-      for (let i = 0; i < n; i++) {
+      push(seen, w);
+      let count = 0;
+      try { count = winLength(w); } catch {}
+      for (let i = 0; i < count; i++) {
         let child;
         try { child = w[i]; } catch { continue; }
         if (child) ownIndex(stack, stack.length, child);
       }
+    }
+    // A named frame showing another site has no readable window.name, but
+    // Chrome still navigates it instead of opening a tab. Match the name
+    // attributes in the same documents the window walk could read.
+    for (let i = 0; i < seen.length; i++) {
+      let doc = null;
+      try { doc = seen[i].document; } catch { continue; }
+      let nl = null;
+      try { nl = docQueryAll(doc, "iframe[name],frame[name]"); } catch { continue; }
+      let found = false;
+      eachNode(nl, (el) => {
+        let a = null;
+        try { a = getAttr(el, "name"); } catch {}
+        if (a === name) found = true;
+      });
+      if (found) return true;
     }
     return false;
   }
@@ -223,10 +247,16 @@
     return !win || !frameNamed(t, win);
   }
 
-  // PopAds blanks a page with open("about:blank", "_self"); never let a
-  // same-tab open through for about: or javascript: URLs. As the URL parser
-  // does, ignore leading spaces and control characters, and tabs and
-  // newlines anywhere.
+  // PopAds blanks a page with open("about:blank", "_self"): block about:
+  // and javascript: URLs aimed in-tab, where they'd run in place of the
+  // page. Aimed at a named frame they reset it instead of opening anything.
+  function blanksPage(url, target) {
+    if (!inertUrl(url)) return false;
+    const t = toLower(`${target ?? ""}`);
+    return t === "_self" || t === "_top" || t === "_parent";
+  }
+  // As the URL parser does, ignore leading spaces and control characters,
+  // and tabs and newlines anywhere.
   function inertUrl(url) {
     const s = `${url ?? ""}`;
     let scheme = "";
@@ -279,8 +309,17 @@
     for (let i = 0; i < list.length; i++) if (test(list[i])) return list[i];
     return undefined;
   };
-  const linkUrl = (a) => getAttr(a, "href") ?? getAttr(a, "xlink:href");
-  const formUrl = (form) => getAttr(form, "action") ?? "";
+  // The console shows where the tab would have gone, resolved the way the
+  // browser resolves it — not the raw attribute.
+  const resolveUrl = (node, value) => {
+    try {
+      const v = value ?? "";
+      if (v === "") return "";
+      return new URLC(v, baseURI(ownerDocument(node)) ?? undefined).href;
+    } catch { return value ?? ""; }
+  };
+  const linkUrl = (a) => resolveUrl(a, getAttr(a, "href") ?? getAttr(a, "xlink:href"));
+  const formUrl = (form) => resolveUrl(form, getAttr(form, "action"));
 
   // --- Child frames ---------------------------------------------------------
 
@@ -469,6 +508,7 @@
     //    armed it becomes a fixed accessor, so whatever the page assigns
     //    stays guarded too.
     const nativeOpen = ownDesc(win, "open")?.value;
+    if (typeof nativeOpen === "function") wsAdd(nativeOpens, nativeOpen);
     const guardedOpen = new WeakMapC();
     const guarded = (fn) => {
       if (typeof fn !== "function") return fn;
@@ -478,11 +518,14 @@
             const self = this ?? win; // a bare open() call means this window
             if (!state.armed) return apply(fn, self, args);
             args = readArgs(args);
-            if (!inertUrl(args[0])) {
-              let view = null;
-              try { view = self.window; } catch {}
-              if (!opensNew(openTarget(args[1]), view)) return apply(fn, self, args);
+            const target = openTarget(args[1]);
+            if (blanksPage(args[0], target)) {
+              log("window.open", args[0]);
+              return null;
             }
+            let view = null;
+            try { view = self.window; } catch {}
+            if (!opensNew(target, view)) return apply(fn, self, args);
             log("window.open", args[0]);
             return null;
           },
@@ -492,10 +535,10 @@
     };
     // A function the page wrote itself (an analytics hook, say) is handed
     // back as is, so `window.open === myHook` holds; whatever it calls is
-    // guarded. Built-in functions, from any frame, are always guarded.
-    const pageWritten = (fn) => {
-      try { return strIndex(fnToString(fn), "[native code]") < 0; } catch { return false; }
-    };
+    // guarded. Only functions seen as window.open in an installed realm
+    // count as built-in: bound functions, proxies and hooks whose source
+    // mentions "[native code]" are returned as they are.
+    const pageWritten = (fn) => typeof fn === "function" && !wsHas(nativeOpens, fn);
     const isOurs = (fn) => typeof fn === "function" && wmGet(guardedOpen, wmGet(nativeOf, fn)) === fn;
     patch(win, "open", guarded(nativeOpen), { value: guarded(nativeOpen), writable: true, enumerable: true, configurable: true });
     rec.lock = () => {
@@ -521,7 +564,8 @@
       open(...args) {
         if (state.armed && args.length >= 3) {
           args = readArgs(args);
-          if (inertUrl(args[0]) || opensNew(openTarget(args[1]), defaultView(this))) {
+          const target = openTarget(args[1]);
+          if (blanksPage(args[0], target) || opensNew(target, defaultView(this))) {
             log("document.open", args[0]);
             return null;
           }
@@ -554,10 +598,10 @@
     }.submit));
     method(win.HTMLFormElement.prototype, "requestSubmit", (native) => ({
       requestSubmit() {
-        if (state.armed && unheard(this) && opensNew(formTarget(this, arguments[0]), viewOf(this))) {
-          log("form.requestSubmit()", formUrl(this));
-          return;
-        }
+        // Run as usual — validation, the page's handlers — and let onSubmit
+        // cancel it late if it still opens a new context. Make sure the
+        // submit is heard even inside a shadow root the browser built.
+        if (state.armed) ensureSubmitHeard(this);
         return apply(native, this, arguments);
       },
     }.requestSubmit));
@@ -728,9 +772,11 @@
     });
 
     // 4. Links: target=_blank, ctrl/cmd/shift-click and middle-click.
-    //    The page's own handlers run after this and may still change the
-    //    target, so look again once they have.
-    const later = (e, opensNow, what, url) => {
+    //    The page's own handlers run after this and may switch the target
+    //    back to _self, so the decision happens in the late check: if the
+    //    target still opens a new context then, cancel. (A page that stops
+    //    propagation beats the late check; see Known gaps.)
+    const later = (e, opensNow, what, url, scope) => {
       const late = (ev) => {
         try {
           if (ev === e && state.armed && !defaultPrevented(e) && opensNow()) {
@@ -743,9 +789,31 @@
         }
       };
       const type = evType(e);
-      addListener(win, type, late, nullProto({ once: true }));
+      addListener(scope, type, late, nullProto({ once: true }));
       // Not left behind if the page stops the event before it gets back here.
-      setTimer(() => removeListener(win, type, late), 0);
+      setTimer(() => removeListener(scope, type, late), 0);
+    };
+    // The late re-check must listen where the event can reach: the window
+    // for document nodes, the shadow root itself for nodes inside one
+    // (submit events and non-composed clicks don't leave a shadow root).
+    const lateScopeOf = (node) => {
+      try {
+        const root = getRootNode(node);
+        if (root && root !== ownerDocument(node)) return root;
+      } catch {}
+      return win;
+    };
+    // A submit event fires where no listener of ours is (yet): a form in a
+    // shadow root the browser built, or a detached form. Make sure one is.
+    const ensureSubmitHeard = (form) => {
+      if (!state.armed) return;
+      try {
+        const root = getRootNode(form);
+        if (root && root !== ownerDocument(form) && !wsHas(listenedRoots, root)) {
+          addListener(root, "submit", onSubmit, true);
+          wsAdd(listenedRoots, root);
+        }
+      } catch {}
     };
     // Fail closed: if the guard itself throws while examining an event
     // (stack exhaustion is the known way), cancel it rather than let the
@@ -765,25 +833,32 @@
         const link = find(path, isLink);
         if (link) {
           if (hasAttr(link, "download") && !middle && !modifier) return;
-          const opens = () => middle || (type === "click" && (modifier || opensNew(linkTarget(link), viewOf(link))));
-          if (opens()) {
+          if (middle || modifier) {
+            // A modifier or middle click opens a new context no matter what
+            // the target says, so even a late switch to _self can't save it.
             preventDefault(e);
             log("link", linkUrl(link));
-          } else if (type === "click") {
-            later(e, opens, "link", () => linkUrl(link));
+          } else {
+            const opens = () => type === "click" && opensNew(linkTarget(link), viewOf(link));
+            later(e, opens, "link", () => linkUrl(link), lateScopeOf(link));
           }
           return;
         }
 
-        // A submit button: ctrl/shift/middle-click opens the result in a new
-        // tab, and so does a form aimed at one. onSubmit sees most of those,
-        // but not a form in a shadow root the browser built from HTML: its
-        // submit event never gets out to a listener of ours.
+        // A submit button: the click itself opens nothing; its submit
+        // decides. A middle or modifier click always opens a new context,
+        // so cancel those; otherwise make sure the submit is heard even
+        // inside a shadow root the browser built, then leave the click
+        // alone: onSubmit cancels it late if it still opens a new context.
         const submit = find(path, isSubmit);
         const form = submit && formOf(submit);
-        if (form && (middle || modifier || (type === "click" && unheard(form) && opensNew(formTarget(form, submit), viewOf(form))))) {
-          preventDefault(e);
-          log("form submit", formUrl(form));
+        if (form) {
+          if (middle || modifier) {
+            preventDefault(e);
+            log("form submit", formUrl(form));
+          } else if (type === "click") {
+            ensureSubmitHeard(form);
+          }
         }
       } catch {
         try { preventDefault(e); } catch {}
@@ -796,12 +871,7 @@
       if (!state.armed || !isElement(form) || localName(form) !== "form") return;
       try {
         const opens = () => opensNew(formTarget(form, submitterOf(e)), viewOf(form));
-        if (opens()) {
-          preventDefault(e);
-          log("form submit", formUrl(form));
-        } else {
-          later(e, opens, "form submit", () => formUrl(form));
-        }
+        later(e, opens, "form submit", () => formUrl(form), lateScopeOf(form));
       } catch {
         try { preventDefault(e); } catch {}
       }

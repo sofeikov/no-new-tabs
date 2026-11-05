@@ -142,7 +142,8 @@ There are two layers.
    usual. A function the site itself assigns to `window.open` (an analytics
    hook) is handed back unchanged; what it calls is still guarded.
    `requestSubmit()` on a `_blank` form still runs the site's validation and
-   submit handlers; only the navigation is cancelled.
+   submit handlers; only the navigation is cancelled. A page hook assigned
+   to `window.open` keeps its identity and still runs on blocked opens.
 
 ## Install
 
@@ -1336,7 +1337,9 @@ blocked `requestWindow()` in a frame likewise returns the parent realm's
 
 The guard logs the first 20 blocks, then one "further blocks on this page
 not logged" line, then nothing ([guard.js:89-94](extension/guard.js#L89-L94)).
-Some ad scripts retry many times a second.
+Some ad scripts retry many times a second. Link and form URLs are logged
+resolved against the document's base URL, the way the browser resolves
+them — not the raw attribute. Test: "console shows resolved URL".
 
 #### window.open
 
@@ -1374,8 +1377,12 @@ Obfuscated forms like `" \tjAvA\nScRiPt:"` get past a simple prefix check.
 **What it does.** `inertUrl` rebuilds the scheme the way the URL parser
 does: it skips leading control characters and spaces, drops tab, LF and CR
 anywhere, stops at 11 characters, and lowercases. It then checks for
-`about:` or `javascript:` ([guard.js:186-200](extension/guard.js#L186-L200)).
-`window.open` and `document.open` block those URLs whatever the target.
+`about:` or `javascript:`. `window.open` and three-argument
+`document.open` block those URLs aimed in-tab (`_self`, `_top`,
+`_parent`), where they would run in place of the page
+([guard.js:253-260](extension/guard.js#L253-L260)). Aimed at a named frame
+that resolves, they go through: the frame resets instead of opening a
+tab, and a missing name still opens a new context (blocked as usual).
 
 **Why not the obvious way.** The browser ignores those characters, so
 `startsWith` on the raw string would pass `java\nscript:`. Test:
@@ -1428,21 +1435,21 @@ wrap window.open".
 `window.open === myHook`. Ad code sets it to a real native from another
 frame.
 
-**What it does.** The getter calls `pageWritten(value)`, which runs the
-original `Function.prototype.toString`, saved before the spoof. If the
-source lacks `[native code]`, the function is the page's own and is
-returned unchanged. Whatever native it calls is a guarded wrapper anyway.
-Natives (from any frame) and bound functions come back guarded; a
-page-written function from another frame is returned unchanged, like any
-other page-written one
-([guard.js:395-401](extension/guard.js#L395-L401),
-[guard.js:409](extension/guard.js#L409)). If `toString` throws, the
-function is treated as native and guarded.
+**What it does.** The getter calls `pageWritten(value)`, which returns
+every function except the native `open`s the guard itself saw at install
+time, in any realm ([guard.js:112](extension/guard.js#L112),
+[guard.js:511](extension/guard.js#L511),
+[guard.js:541](extension/guard.js#L541)). A page-written hook — bound, a
+proxy, or one whose source happens to mention `[native code]` — is returned
+unchanged, so `window.open === myHook` holds even after the tag manager
+reassigns it fifty times. Whatever native it calls is a guarded wrapper
+anyway, so blocked opens still go through the hook first.
 
-**Why not the obvious way.** It must use the original `toString`. The spoof
-would report the guard's own wrappers as native. Bound functions print
-`[native code]`, so a bound native `open` is guarded. Test: "window.open ===
-the site's own hook".
+**Why not the obvious way.** Source text cannot tell a hook from a native:
+a bound function prints `[native code]`, and so does a proxy of the
+guarded wrapper (whose `toString` reports native source). Only functions
+the guard itself saw as `window.open` count as native. Test: "page
+window.open hook keeps identity".
 
 ##### `document.open` with three arguments
 
@@ -1744,14 +1751,18 @@ window) and middle-click all open new contexts. Downloads must still work.
 
 **What it does.** `onActivate` is a capture listener on the window for
 `click` and `auxclick`, so it runs before page handlers
-([guard.js:659-697](extension/guard.js#L659-L697)). It returns early if the
+([guard.js:822-868](extension/guard.js#L822-L868)). It returns early if the
 event is already `defaultPrevented` (handled further out, which avoids
 double handling between window and shadow-root listeners). It takes the
 first link in the saved `composedPath`, so the innermost link wins. A link
-with `download` is left alone unless it is a middle or modifier click. It
-blocks a middle `auxclick`, a click with Ctrl, Meta or Shift, a `click`
-with button 1 (a script dispatching one is treated as a middle click), or
-a click whose target opens a new context.
+with `download` is left alone unless it is a middle or modifier click. A
+middle `auxclick`, a click with Ctrl, Meta or Shift, or a `click` with
+button 1 (a script dispatching one is treated as a middle click) is
+cancelled at once: no target switch can save it, since a modifier or
+middle click opens a new context whatever the target says. A plain click
+is never cancelled here; its fate is decided in the late check below, so a
+page handler that switches the target back to `_self` gets a working link
+instead of a dead click.
 
 **Why not the obvious way.** `composedPath` sees through open shadow roots,
 where `e.target` is retargeted to the host. A `_blank` download starts a
@@ -1762,33 +1773,35 @@ anything.
 
 **Problem.** A page handler that runs after the guard can set
 `link.target = "_blank"`, insert `<base target=_blank>` or change
-`form.target`.
+`form.target` — or switch a `_blank` target back to `_self`, in which case
+cancelling up front would leave a dead click.
 
-**What it does.** When a click or submit does not open a new context yet,
-`later()` adds a one-time non-capture listener on the window for the same
-event type. It runs after the target and bubble-phase handlers and re-runs
-the same check ([guard.js:638-656](extension/guard.js#L638-L656)). `ev === e`
-ignores a different event of the same type. A `setTimeout(0)` removes the
-listener if the page stopped propagation.
+**What it does.** `later()` adds a one-time non-capture listener for the
+same event type and decides there: if the target still opens a new context
+after the page's handlers ran, it cancels
+([guard.js:779-798](extension/guard.js#L779-L798)). `ev === e` ignores a
+different event of the same type. A `setTimeout(0)` removes the listener if
+the page stopped propagation. The listener is added where the event can
+reach: the window for document events, the shadow root itself for events
+inside one (submit events and non-composed clicks never leave it).
 
-**Why not the obvious way.** Capture-only checks are too early. Bubble-only
-checks are beaten by `stopPropagation`. Checking at both ends covers a page
-that changes the target, or one that stops the event, but not a handler
-that does both: it changes the target and then stops propagation, so the
-late check never runs. The late listener is also always on the window
-([guard.js:609](extension/guard.js#L609)). It never fires for events that
-stay inside a shadow root (all `submit` events and non-composed clicks), so
-a target changed by a handler inside a shadow root is not caught in the
-page. In those cases the background layer closes the tab (a brief flash).
-Tests: `target set by a page click handler`, `<base target> set by a click
-handler`, `form target set by a submit handler`.
+**Why not the obvious way.** Capture-only checks are too early, and a
+capture cancel would also kill clicks the page legitimately switches back
+to `_self`. Bubble-only checks are beaten by `stopPropagation`: a handler
+that changes the target and then stops propagation beats both checks, so
+the late check never runs. In those cases the background layer closes the
+tab (a brief flash). Tests: `target set by a page click handler`, `<base
+target> set by a click handler`, `form target set by a submit handler`,
+`late _self switch on link`, `late _self switch on form`.
 
 ##### Forms and `onSubmit`
 
 A capture `submit` listener on the window computes the target from the
 submitter's `formtarget`, then the form's `target`, then `<base target>`
 ([guard.js:224-227](extension/guard.js#L224-L227),
-[guard.js:647-657](extension/guard.js#L647-L657)). The submitter comes from
+[guard.js:869-878](extension/guard.js#L869-L878)). It never cancels at
+capture: like links, submits are decided in the late check, so a handler
+that switches the target back to `_self` still works. The submitter comes from
 the saved `SubmitEvent.prototype.submitter` getter, in `try/catch` so a
 plain `new Event('submit')` cannot make it throw. `isSubmit` matches
 `input[type=submit]`, `input[type=image]` and
@@ -1803,10 +1816,10 @@ form comes from the native `form` getter of `HTMLButtonElement` or
 
 Ctrl, Shift or middle clicks on a submit button open the result in a new
 tab. If no link is in the path, `onActivate` looks for a submit button and
-blocks those ([guard.js:634-643](extension/guard.js#L634-L643)). It also
-blocks a plain click on a `_blank` form whose submit event the guard cannot
-hear (see the next item). For forms it can hear, the plain `_blank` case is
-left to `onSubmit`, so validation and the page's handlers still run.
+cancels those at once: a modifier or middle click opens a new context
+whatever the target later says. A plain click is never cancelled: the click
+itself opens nothing, and `onSubmit` decides late whether the submit still
+opens a new context, so validation and the page's handlers still run.
 
 ##### Shadow DOM: listen inside every `attachShadow` root
 
@@ -1824,9 +1837,10 @@ built by the parser ([guard.js:444-447](extension/guard.js#L444-L447)).
 
 **Why not the obvious way.** Declarative roots (`<template shadowrootmode>`)
 never call `attachShadow`, so they stay unheard. The `click()`,
-`dispatchEvent`, `requestSubmit` and submit-button paths cover them. Real
-clicks inside a closed declarative root are invisible in the page and fall
-to the background layer.
+`dispatchEvent` and `requestSubmit` paths cover them, and a submit-button
+click or `requestSubmit` ensures a submit listener inside the root on the
+spot. A real non-composed click on a link inside a closed declarative root
+stays invisible in the page and falls to the background layer.
 
 ##### `.click()` and `dispatchEvent` on links no listener can see
 
@@ -1849,9 +1863,13 @@ listeners stay the single source of truth.
 `form.submit()` fires no submit event, so its wrapper checks the form's
 target directly, in every realm ([guard.js:448-456](extension/guard.js#L448-L456)).
 `requestSubmit()` runs validation and a real submit event that the page's
-handlers rely on, so its wrapper blocks only forms whose submit event the
-guard cannot hear. Elsewhere the native call runs and `onSubmit` cancels the
-navigation after the page's handlers ([guard.js:457-465](extension/guard.js#L457-L465)).
+handlers rely on, so its wrapper never blocks: it first makes sure the submit is heard
+(adding a listener inside a shadow root the browser built, which the parser
+never sent through `attachShadow`), then runs the native call, and
+`onSubmit` cancels the navigation late if it still opens a new context
+([guard.js:618-627](extension/guard.js#L618-L627)). A submit-button click
+takes the same road: it only ensures the submit is heard and leaves the
+click alone.
 Test: "requestSubmit runs the site's submit handler" (exactly once, and no
 tab).
 
@@ -1896,7 +1914,11 @@ caller itself if it is sandboxed (a sandboxed frame can only navigate itself
 and its descendants). It reads names with the native getter. Cross-origin
 frames are walked through, because `length` and indexing work across
 origins, but their names throw and do not count. The walk stops after 500
-windows ([guard.js:148-173](extension/guard.js#L148-L173)). `isSandboxed`
+windows. When no readable window matches, it matches `name` attributes on
+`<iframe>` and `<frame>` elements in the same documents it could read: a
+frame showing another site has no readable `window.name`, but Chrome still
+navigates it instead of opening a tab
+([guard.js:194-229](extension/guard.js#L194-L229)). `isSandboxed`
 treats origin `"null"` or a `sandbox` attribute on the frame element as
 sandboxed.
 
@@ -1904,7 +1926,7 @@ sandboxed.
 sandboxed frame "open into" a sibling. The browser refuses that and opens a
 new tab. Counting cross-origin frames is unsafe too. Tests: "sandboxed frame
 opens into a sibling", "window.open into named iframe works", "sibling
-frame's window.open into it".
+frame's window.open into it", "named iframe showing another site".
 
 ##### Fail closed on doubt
 
@@ -2211,12 +2233,12 @@ the new tab a moment later.
 - **Closed shadow roots written straight into HTML**
   (`<template shadowrootmode="closed">`): a click on a `_blank` link inside
   one gets past the in-page guard.
-- **A target changed late, in some ways** (from reading the code). A page
-  handler that changes a link's or form's target and also stops
-  propagation beats both of the guard's checks. So does a handler inside a
-  shadow root that changes the target, because the late check listens on
-  the window, which `submit` events and non-composed clicks never reach
-  ([guard.js:638-656](extension/guard.js#L638-L656)).
+- **A target changed late plus stopped propagation** (from reading the
+  code). Plain clicks and submits are decided in the late check, which also
+  listens inside shadow roots, so a handler that only changes the target is
+  covered. A handler that changes the target and also stops propagation
+  beats both checks: the late check never runs. Modifier and middle clicks
+  are still cancelled up front, so they are not affected.
 - **A page capture listener could stop the arm signal** (from reading the
   code). The guard's control listeners are not capture listeners
   ([guard.js:124-127](extension/guard.js#L124-L127)), so a page listener on
