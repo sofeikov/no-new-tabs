@@ -30,6 +30,14 @@ const UNLISTED = `http://127.0.0.1:${PORT}`;
 const HOSTS = "--host-resolver-rules=MAP *.test 127.0.0.1";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const within = (p, ms) => Promise.race([p, sleep(ms).then(() => { throw new Error(`no response in ${ms} ms`); })]);
+// Elapsed-time prefix on section headers, for profiling slow sections.
+const t0 = Date.now();
+const rawLog = console.log.bind(console);
+console.log = (...a) => {
+  if (typeof a[0] === "string" && (a[0].startsWith("\n===") || a[0].startsWith("\n#####"))) {
+    rawLog(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]${a[0]}`, ...a.slice(1));
+  } else rawLog(...a);
+};
 
 function findChrome() {
   if (process.env.CHROME) return process.env.CHROME;
@@ -226,7 +234,15 @@ async function openCase(start, action, { reload = true } = {}) {
     watch(page);
     return { error: e.message.split("\n")[0] };
   }
-  await page.waitForTimeout(1200);
+  // Settle fast instead of a fixed wait: stop once the created set is
+  // stable, capped above the old fixed wait so slow closes still count.
+  let last = "", calm = 0;
+  for (const end = Date.now() + 2000; ; await page.waitForTimeout(100)) {
+    const snap = created.map((p) => p.isClosed()).join(",");
+    if (snap === last && ++calm >= 8) break;
+    if (snap !== last) { last = snap; calm = 0; }
+    if (Date.now() >= end) break;
+  }
   context.off("page", onPage);
   const survivors = created.filter((p) => !p.isClosed());
   const ret = await page.evaluate(() => window.__ret).catch(() => undefined);
@@ -582,7 +598,20 @@ async function rawCase(action, p = rp) {
   } catch (e) {
     return { error: e.message.split("\n")[0] };
   }
-  await sleep(1200);
+  // Settle fast instead of a fixed wait. Tab creation is synchronous with
+  // the action, so if no target appears within 700 ms none is coming; once
+  // targets exist, stop when the survivor set is stable, capped above the
+  // old fixed wait so slow closes on a cold worker are still observed.
+  const snapshot = () => raw.pagesSince(since).filter((t) => t.targetId !== p.targetId)
+    .map((t) => `${t.targetId}:${!!t.destroyed}`).sort().join(",");
+  for (const end = Date.now() + 700; !snapshot() && Date.now() < end; await sleep(100)) {}
+  let last = snapshot(), calm = 0;
+  for (const end = Date.now() + 2000; ; await sleep(100)) {
+    const snap = snapshot();
+    if (snap === last && ++calm >= 8) break;
+    if (snap !== last) { last = snap; calm = 0; }
+    if (Date.now() >= end) break;
+  }
   const created = raw.pagesSince(since).filter((t) => t.targetId !== p.targetId);
   const survivors = created.filter((t) => !t.destroyed);
   for (const t of survivors) await raw.send("Target.closeTarget", { targetId: t.targetId }).catch(() => {});
@@ -1210,7 +1239,7 @@ async function overblocking() {
       window.__frLoads = 0;
       const f = document.createElement("iframe");
       f.name = "h-fr";
-      f.src = "http://127.0.0.1:8799/target.html?case=h-cross1";
+      f.src = "http://127.0.0.1:${PORT}/target.html?case=h-cross1";
       f.addEventListener("load", () => window.__frLoads++);
       document.body.append(f);
     })()`);
@@ -1218,7 +1247,7 @@ async function overblocking() {
     await rp.eval(`(() => {
       const a = document.createElement("a");
       a.id = "h-frgo";
-      a.href = "http://127.0.0.1:8799/target.html?case=h-cross2";
+      a.href = "http://127.0.0.1:${PORT}/target.html?case=h-cross2";
       a.target = "h-fr";
       a.textContent = "x";
       document.body.append(a);
@@ -1259,7 +1288,7 @@ async function overblocking() {
   });
   r = await rawCase(() => rp.click("#link-blank"));
   const logged = msgs.filter((t) => t.includes("case=blank"));
-  report("console shows resolved URL", !r.error && r.created === 0 && logged.some((t) => t.includes("http://localhost:8799/target.html?case=blank")),
+  report("console shows resolved URL", !r.error && r.created === 0 && logged.some((t) => t.includes(`http://localhost:${PORT}/target.html?case=blank`)),
     `(created ${r.created}, sample: ${(logged[0] ?? "none").slice(0, 90)})`);
 }
 
@@ -1287,51 +1316,78 @@ async function popupChain() {
   report("both windows closed", !r.error && r.survived === 0, `(created ${r.created})`);
 }
 
+// --- Orchestration: sharded, filterable, lazily launched -------------------
+// Each step names the browser it needs. With TEST_ONLY unset every step runs
+// in the historical order, which this table preserves exactly. TEST_ONLY is a
+// comma-separated list of step ids (or `index:id`) to run instead — each
+// worker in a parallel run takes its own slice, with its own PORT.
+const STEPS = [
+  { id: "optionsPage", setup: "pw", run: optionsPage },
+  { id: "mode:blocked", setup: "pw", run: () => mode("Blocked site (localhost): full extension (no tab may even flash)", LISTED, true, true) },
+  { id: "sanity:blocked", setup: "pw", run: async () => { console.log("\n=== Blocked site: page keeps working ==="); for (const [name, ok] of await sanity(LISTED, true)) report(name, ok); } },
+  { id: "mode:control", setup: "pw", run: () => mode("Control site (127.0.0.1, not listed)", UNLISTED, false, false) },
+  { id: "unlistedIsUntouched", setup: "pw", run: unlistedIsUntouched },
+  { id: "frameAdoption", setup: "pw", run: frameAdoption },
+  { id: "insecureSite", setup: "pw", run: insecureSite },
+  { id: "pictureInPicture", setup: "pw", run: pictureInPicture },
+  { id: "userTabsSurvive", setup: "pw", run: userTabsSurvive },
+  { id: "tabUnder", setup: "rawExt", run: tabUnder },
+  { id: "workerRestart", setup: "rawExt", run: workerRestart },
+  { id: "contextMenu", setup: "rawExt", run: contextMenu },
+  { id: "fakeMenuRecord", setup: "rawExt", run: fakeMenuRecord },
+  { id: "menuRecordAuthenticity", setup: "rawExt", run: menuRecordAuthenticity },
+  { id: "docOpenMenus", setup: "rawExt", run: docOpenMenus },
+  { id: "syntheticClicks", setup: "rawExt", run: syntheticClicks },
+  { id: "liveArmNoInput", setup: "rawExtNoPopup", run: liveArmNoInput },
+  { id: "hardening", setup: "rawExtNoPopup", run: hardening },
+  { id: "unreachedFrames", setup: "rawExtNoPopup", run: unreachedFrames },
+  { id: "overblocking", setup: "rawExtNoPopup", run: overblocking },
+  { id: "rawMode", setup: "rawBg", run: () => rawMode("Blocked site (localhost): background layer only", LISTED) },
+  { id: "rawUserTabsSurvive", setup: "rawBg", run: rawUserTabsSurvive },
+  { id: "tabUnder:bgOnly", setup: "rawBg", run: tabUnder },
+  { id: "workerRestart:bgOnly", setup: "rawBg", run: workerRestart },
+  { id: "listedFrameInUnlistedPage", setup: "rawBg", run: listedFrameInUnlistedPage },
+  { id: "noSourceTabs", setup: "rawBg", run: noSourceTabs },
+  { id: "storageWrites", setup: "rawBg", run: storageWrites },
+  { id: "reloadEdge", setup: "rawBg", run: reloadEdge },
+  { id: "menuKept", setup: "rawBg", run: menuKept },
+  { id: "popupChain", setup: "rawBgNoPopup", run: popupChain },
+];
+const GROUP_HEADER = {
+  rawExt: "Full extension, raw CDP",
+  rawBg: "Background layer only (no content scripts)",
+};
+let bgOnlyDir = null;
+const activeSetups = new Set();
+async function ensureSetup(which) {
+  if (which === "pw") {
+    if (!activeSetups.has("pw")) { await launch(EXT); activeSetups.add("pw"); }
+    return;
+  }
+  // Leaving the Playwright browser behind closes it, as the old flow did.
+  if (activeSetups.has("pw")) { await context?.close(); context = null; activeSetups.delete("pw"); }
+  if (which === "rawBg" || which === "rawBgNoPopup") {
+    bgOnlyDir ??= backgroundOnlyCopy();
+    await launchRawBrowser(bgOnlyDir, which === "rawBgNoPopup" ? ["--disable-popup-blocking"] : []);
+  } else if (which === "rawExtNoPopup") {
+    await launchRawBrowser(EXT, ["--disable-popup-blocking"]);
+  } else {
+    await launchRawBrowser(EXT);
+  }
+}
+
 try {
-  await launch(EXT);
-  await optionsPage();
-  await mode("Blocked site (localhost): full extension (no tab may even flash)", LISTED, true, true);
-  console.log("\n=== Blocked site: page keeps working ===");
-  for (const [name, ok] of await sanity(LISTED, true)) report(name, ok);
-  await mode("Control site (127.0.0.1, not listed)", UNLISTED, false, false);
-  await unlistedIsUntouched();
-  await frameAdoption();
-  await insecureSite();
-  await pictureInPicture();
-  await userTabsSurvive();
-  await context.close();
-  context = null;
-
-  console.log("\n##### Full extension, raw CDP #####");
-  await launchRawBrowser(EXT);
-  await tabUnder();
-  await workerRestart();
-  await contextMenu();
-  await fakeMenuRecord();
-  await menuRecordAuthenticity();
-  await docOpenMenus();
-  await syntheticClicks();
-  await launchRawBrowser(EXT, ["--disable-popup-blocking"]);
-  await liveArmNoInput();
-  await hardening();
-  await unreachedFrames();
-  await overblocking();
-
-  console.log("\n##### Background layer only (no content scripts) #####");
-  const bgOnly = backgroundOnlyCopy();
-  await launchRawBrowser(bgOnly);
-  await rawMode("Blocked site (localhost): background layer only", LISTED);
-  await rawUserTabsSurvive();
-  await tabUnder();
-  await workerRestart();
-  await listedFrameInUnlistedPage();
-  await noSourceTabs();
-  await storageWrites();
-  await reloadEdge();
-  await menuKept();
-
-  await launchRawBrowser(bgOnly, ["--disable-popup-blocking"]);
-  await popupChain();
+  const only = (process.env.TEST_ONLY ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const steps = STEPS.map((s, index) => ({ ...s, index }))
+    .filter((s) => !only.length || only.some((f) => s.id.includes(f) || `${s.index}:${s.id}` === f || `${s.index}:` === f));
+  if (only.length && !steps.length) throw new Error(`TEST_ONLY matched nothing: ${only.join(",")}`);
+  let lastSetup = null;
+  for (const step of steps) {
+    if (step.setup !== lastSetup && GROUP_HEADER[step.setup]) console.log(`\n##### ${GROUP_HEADER[step.setup]} #####`);
+    lastSetup = step.setup;
+    await ensureSetup(step.setup);
+    await step.run();
+  }
 } catch (err) {
   failures++;
   console.log("\nERROR:", err);

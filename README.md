@@ -216,7 +216,7 @@ This starts a local test site and loads the extension into Chromium. It
 uses Playwright's cached Chromium build, or the browser you name with
 `CHROME=/path/to/chrome`. Auto-detection of Playwright's Chromium only
 works on Linux: it looks for `chrome-linux64/chrome`
-([run.mjs:34-41](test/run.mjs#L34-L41)). On macOS or Windows, set `CHROME=`
+([run.mjs:42-49](test/run.mjs#L42-L49)). On macOS or Windows, set `CHROME=`
 to a Chromium binary. Recent branded Chrome builds ignore
 `--load-extension`, so use Chromium. The test site listens on port 8799;
 set `PORT=` if that is taken.
@@ -225,6 +225,24 @@ set `PORT=` if that is taken.
 # from test/
 CHROME=/usr/bin/chromium PORT=9000 node run.mjs
 ```
+
+The full run takes about eight minutes, most of it waiting for tabs to
+settle. `test/parallel.mjs` splits the same steps across workers — one
+browser and one test server per shard, all assertions identical — which
+brings it down to about two minutes on a many-core machine:
+
+```bash
+# from test/
+CHROME=/usr/bin/chromium node parallel.mjs        # 6 shards by default
+CHROME=/usr/bin/chromium SHARDS=4 node parallel.mjs
+CHROME=/usr/bin/chromium node parallel.mjs 0-7,8-15,16-30
+```
+
+`TEST_ONLY` runs a slice of the suite in one browser, for iterating on a
+single area (`TEST_ONLY=menuKept`, or exact `index:id` steps like
+`TEST_ONLY=3:,20:`; step ids are the test function names in the `STEPS`
+table at the bottom of `run.mjs`). Each worker takes its own `PORT`
+(`8799` plus the shard number).
 
 Matching logic that a headless browser cannot drive (Brave's native
 "Go to <address>" item) is covered by unit vectors through the shipped
@@ -258,8 +276,8 @@ PASSED):
   hidden-frame open with and without leaving, and the six-redirect chain)
   are also run with the worker stopped first, as Chrome does after 30 s
   idle, and so are the listed-iframe "leaves" and "is removed" cases
-  ([run.mjs:635-644](test/run.mjs#L635-L644),
-  [run.mjs:655-662](test/run.mjs#L655-L662)).
+  ([run.mjs:664-673](test/run.mjs#L664-L673),
+  [run.mjs:684-691](test/run.mjs#L684-L691)).
 - **Plain-http sites** (not secure contexts), picture-in-picture windows,
   and context menus: a right-click must not open the door for a link click
   that gets past the guard.
@@ -358,7 +376,7 @@ code does about it, and why the obvious approach fails.
 
 The background layer works on its own. The test suite runs every case
 against a copy of the extension with the content scripts deleted
-([run.mjs:46-55](test/run.mjs#L46-L55)). The in-page layer exists so you
+([run.mjs:54-63](test/run.mjs#L54-L63)). The in-page layer exists so you
 don't see a tab open and close.
 
 #### Two scripts in two worlds, both at `document_start` in every frame
@@ -428,7 +446,7 @@ but Chrome sets it for Ctrl+T from a tab too. Keying on it would close the
 user's own new tabs. The tests reproduce those shapes (`createTarget`
 newtab and about:blank, duplicate, `tabs.create` with an opener,
 `windows.create`) and require them all to survive
-([run.mjs:456-488](test/run.mjs#L456-L488)).
+([run.mjs:472-504](test/run.mjs#L472-L504)).
 
 ##### Browser-made tabs from the page's links are judged too
 
@@ -603,7 +621,7 @@ hide the listed state from both. Restored entries get `seq 0`, which always
 counts as "before" ([background.js:49](extension/background.js#L49)).
 Test: "hidden-frame open, then 6 redirects", served by a `/chain?n=N` route
 that redirects with `location.replace`
-([run.mjs:62-67](test/run.mjs#L62-L67)).
+([run.mjs:70-75](test/run.mjs#L70-L75)).
 
 ##### Walking up the frame tree as it was (`frameWasListed`)
 
@@ -1062,7 +1080,7 @@ exists in secure contexts. It is missing on plain-http sites, so the guard
 would never arm there. `localhost` counts as a secure context even over
 http, so a suite that only uses `localhost` would not notice; the tests map
 `*.test` to the local server to cover this
-([run.mjs:420-438](test/run.mjs#L420-L438)). The secret is a string
+([run.mjs:436-454](test/run.mjs#L436-L454)). The secret is a string
 because Chrome hands a `CustomEvent.detail` from the isolated world to the
 page's world only as a primitive: an object made in `arm.js` would show up
 as `null` in `guard.js`. The guard compares it by value, read through the
@@ -1985,7 +2003,7 @@ and accessors (`appendChild`, `append`, `insertAdjacentHTML`, `write`,
 `open`, `click`, `dispatchEvent`, `attachShadow`, `submit`,
 `requestSubmit`, the `innerHTML` setter and the `contentWindow` getter) is
 native again, `window.open` is a data property and the marker is gone
-([run.mjs:364-405](test/run.mjs#L364-L405)).
+([run.mjs:380-421](test/run.mjs#L380-L421)).
 
 ##### Undo restores only if the slot is still the guard's
 
@@ -2060,7 +2078,7 @@ browser or a parallel run.
 Every CDP call races a 10 s timer, and each case runs under 15 s. In
 Playwright mode a stuck case closes all pages and continues
 ([cdp.mjs:46-50](test/cdp.mjs#L46-L50),
-[run.mjs:214-228](test/run.mjs#L214-L228)). Tests of tab-killing code are
+[run.mjs:222-236](test/run.mjs#L222-L236)). Tests of tab-killing code are
 the ones most likely to hang.
 
 #### Real, trusted input
@@ -2100,9 +2118,9 @@ bugs in saving and restoring state.
 plain-http sites are present there. The Playwright browser launches with
 `--host-resolver-rules=MAP *.test 127.0.0.1`
 ([run.mjs:28-30](test/run.mjs#L28-L30),
-[run.mjs:176](test/run.mjs#L176)); the raw-CDP browser does not need it.
+[run.mjs:184](test/run.mjs#L184)); the raw-CDP browser does not need it.
 `insecureSite()` checks `listed.test` and `plain.test` with
-`!isSecureContext` ([run.mjs:420-438](test/run.mjs#L420-L438)). No DNS or hosts-file changes
+`!isSecureContext` ([run.mjs:436-454](test/run.mjs#L436-L454)). No DNS or hosts-file changes
 are needed.
 
 #### One server, two origins
@@ -2112,13 +2130,13 @@ The same server is reached as `http://localhost:PORT` (listed) and
 control run also tests a listed frame inside an unlisted page: cases named
 "cross-origin …" must be blocked in both runs
 ([run.mjs:25-27](test/run.mjs#L25-L27),
-[run.mjs:243-256](test/run.mjs#L243-L256)).
+[run.mjs:259-272](test/run.mjs#L259-L272)).
 
 #### The "no flash" standard
 
 In full-extension mode a case passes only if no tab was created at all,
 not just closed, and the page is still on its starting URL (unless the case
-leaves on purpose) ([run.mjs:243-256](test/run.mjs#L243-L256)). Checking
+leaves on purpose) ([run.mjs:259-272](test/run.mjs#L259-L272)). Checking
 only survivors would pass even if every case relied on the background.
 
 #### Background-only mode
@@ -2126,21 +2144,21 @@ only survivors would pass even if every case relied on the background.
 `backgroundOnlyCopy()` copies the extension and deletes `content_scripts`
 from the manifest, then the whole case table runs through the raw driver,
 plus user tabs, tab-under, cold worker, listed frame in an unlisted page and
-the popup chain ([run.mjs:46-55](test/run.mjs#L46-L55),
-[run.mjs:729-739](test/run.mjs#L729-L739)).
+the popup chain ([run.mjs:54-63](test/run.mjs#L54-L63),
+[run.mjs:758-768](test/run.mjs#L758-L768)).
 
 #### Popup blocker off where it would hide the result
 
 `liveArmNoInput` and `popupChain` run with `--disable-popup-blocking`
-([run.mjs:726-739](test/run.mjs#L726-L739)). Otherwise a pass would only
+([run.mjs:755-768](test/run.mjs#L755-L768)). Otherwise a pass would only
 reflect Chrome's own blocker.
 
 #### Stable coordinates
 
 The loaders wait for both cross-origin frames, for `document.fonts.ready`
 (text reflows when fonts arrive), and 150 ms for `arm.js` to read the list
-([run.mjs:204-212](test/run.mjs#L204-L212),
-[run.mjs:537-545](test/run.mjs#L537-L545)). A click that lands on nothing
+([run.mjs:212-220](test/run.mjs#L212-L220),
+[run.mjs:553-561](test/run.mjs#L553-L561)). A click that lands on nothing
 makes a blocking test pass for the wrong reason.
 
 ### Ad-script tricks seen in the wild and how each is defeated
