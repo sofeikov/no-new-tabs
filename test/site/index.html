@@ -217,6 +217,13 @@
     <a id="menu-samelink" href="/target.html?case=samelink"><img id="menu-sameimg" style="width:8px;height:8px" alt="thumb"
       src="/target.html?case=samelink"></a>
     <img id="menu-broken" style="width:8px;height:8px" alt="broken" src="/target.html?case=not-an-image">
+    <div id="menu-closed-host" style="display:inline-block"></div>
+    <script>
+      document.getElementById("menu-closed-host").attachShadow({ mode: "closed" }).innerHTML =
+        '<img id="menu-closedimg" style="width:8px;height:8px;display:block" alt="closed" src="/px.png?closed-shadow">';
+    </script>
+    <svg id="menu-svg" width="8" height="8"><image id="menu-svgimg" href="/px.png?svg" width="8" height="8"/></svg>
+    <input type="image" id="menu-inputimg" style="width:8px;height:8px" alt="go" src="/px.png?input">
   </section>
 </body>
 </html>

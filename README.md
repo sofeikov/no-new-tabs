@@ -801,10 +801,17 @@ be able to use this as a loophole.
 
 **What it does.** A capture `contextmenu` listener in `arm.js` runs only
 when the frame is armed and `e.isTrusted`
-([arm.js:76-92](extension/arm.js#L76-L92)). It sends
+([arm.js:119-150](extension/arm.js#L119-L150)). It sends
 `{ type: "contextMenu", selection, srcs }`. `srcs` are the `currentSrc` and
-`src` of images and media along `e.composedPath()` (which crosses shadow
-roots), plus `<source src>` children of media. If `getSelection()` is empty,
+`src` of images and media along `e.composedPath()` (which crosses open
+shadow roots), plus `<source src>` children of media. Closed shadow trees
+hide their nodes from `composedPath()`, so the elements under the pointer
+are walked separately with `elementFromPoint()`, stepping into each open
+or closed root with `chrome.dom.openOrClosedShadowRoot` (needs the `"dom"`
+permission, [manifest.json:6-11](extension/manifest.json#L6-L11)). That walk
+also collects SVG `<image>` (`href` resolved against the document) and
+`<input type=image>` (`.src`), which the browser treats as images for the
+menu but which are not `HTMLImageElement`. If `getSelection()` is empty,
 the selection is read from the focused input or textarea, because the
 Selection API does not see text selected inside form fields. The background
 keys the record by `sender.tab.id`, which comes from the browser, keeps at
@@ -823,7 +830,7 @@ alone would miss shadow-DOM images and the source the browser chose from
 page-opened tab right after cannot match its leftovers.
 
 **What it does.** Trusted `mousedown` and `keydown` in the capture phase
-send `contextMenuClosed` ([arm.js:93-101](extension/arm.js#L93-L101)). While
+send `contextMenuClosed` ([arm.js:110-118](extension/arm.js#L110-L118)). While
 a native context menu is open the page receives neither, so the first one
 means the menu has closed. The background deletes the record
 ([background.js:362-365](extension/background.js#L362-L365)).
@@ -2245,8 +2252,6 @@ them.
     the PDF viewer's frames like normal frames, so the PDF rule
     ([background.js:289-297](extension/background.js#L289-L297)) never
     fires.
-  - "Open image in new tab" on images inside a closed shadow root or an SVG
-    `<image>`. `arm.js` does not report those sources.
 - **Test coverage.** No test checks that a context-menu tab the user chose
   is kept: the suite only checks that a menu is reported, that it ends on
   the next click, and that it does not let a page-opened tab through. The
