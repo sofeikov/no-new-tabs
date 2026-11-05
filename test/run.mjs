@@ -767,6 +767,60 @@ async function fakeMenuRecord() {
   report("broken image is not reported", Array.isArray(srcsBroken) && srcsBroken.length === 0);
 }
 
+// Issue 4: document.open() drops every listener on the window and document,
+// including the extension's. A menu right after a rewrite must still be
+// reported (only then can the background keep the chosen tab), and a
+// rewritten unlisted page must still arm when its site is listed. A kept
+// tab itself cannot be driven headless (no native menu), so these assert
+// the record and the arming, which is exactly what the rewrite destroys.
+async function docOpenMenus() {
+  console.log("\n=== Context menu after document.open() (issue 4) ===");
+  const record = () => raw.swEval(`chrome.storage.session.get("menus").then((s) => Object.values(s.menus ?? {})[0] ?? null)`);
+  // A. The listed page rewrites itself.
+  await rawLoad(`${LISTED}/index.html`);
+  await rp.click("#menu-attack", { button: "right" });
+  await sleep(400);
+  report("menu reported before rewrite", !!(await record()));
+  await rp.eval(`document.open(); document.write('<p id="rewritten">zqxj rewritten selection words</p>'); document.close();`);
+  await sleep(400);
+  await rp.eval(`(() => {
+    const el = document.getElementById("rewritten");
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+  })()`);
+  await rp.click("#rewritten", { button: "right" });
+  await sleep(400);
+  report("menu reported after document.open()", ((await record())?.selection ?? "").includes("rewritten"));
+  // B. An editor-style same-origin iframe written with document.open().
+  await rawLoad(`${LISTED}/index.html`);
+  await rp.eval(`(() => {
+    const doc = document.getElementById("sib").contentDocument;
+    doc.open(); doc.write('<p id="ed">zqxj editor selection words</p>'); doc.close();
+  })()`);
+  await sleep(400);
+  await rp.eval(`(() => {
+    const win = document.getElementById("sib").contentWindow;
+    const el = win.document.getElementById("ed");
+    const range = el.ownerDocument.createRange();
+    range.selectNodeContents(el);
+    win.getSelection().removeAllRanges();
+    win.getSelection().addRange(range);
+  })()`);
+  await rp.clickIn("#sib", "#ed", { button: "right" });
+  await sleep(400);
+  report("menu reported in rewritten iframe", ((await record())?.selection ?? "").includes("editor"));
+  // C. A page rewritten while unlisted arms once its site is listed.
+  await rawLoad(`${UNLISTED}/index.html`);
+  await rp.eval(`document.open(); document.write('<p id="q">rewritten while unlisted</p>'); document.close();`);
+  await sleep(400);
+  await raw.setDomains(["localhost", "127.0.0.1"]);
+  await sleep(400);
+  report("rewritten unlisted page arms when listed", await rp.eval("window.__noNewTabsGuard?.() === true"));
+  await raw.setDomains(["localhost"]);
+}
+
 // Adding a site arms an open page, hidden frames included, even before any
 // input (needs the popup blocker off for the frame to open anything).
 async function liveArmNoInput() {
@@ -811,6 +865,7 @@ try {
   await workerRestart();
   await contextMenu();
   await fakeMenuRecord();
+  await docOpenMenus();
   await launchRawBrowser(EXT, ["--disable-popup-blocking"]);
   await liveArmNoInput();
 
