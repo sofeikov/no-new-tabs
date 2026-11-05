@@ -398,6 +398,10 @@ async function unlistedIsUntouched() {
     f.remove();
     return ok;
   }));
+  // Issue 13: the removed-state passthrough above is timing only (probes
+  // show adopting 300 empty frames costs nothing next to the ~3 ms of
+  // creating each frame's document), so the delta-adoption coverage lives
+  // on the listed side, in frameAdoption() below.
   report("assigned window.open is the same object", await page.evaluate(() => {
     const stub = function () { return "mine"; };
     window.open = stub;
@@ -415,6 +419,31 @@ async function unlistedIsUntouched() {
   const r2 = await openCase(`${UNLISTED}/index.html`, (d) => d.click("#j-static"), { reload: false });
   report("... including its hidden frames", r2.created === 0 && r2.survived === 0);
   await setDomains(["localhost"]);
+}
+
+// Issue 13: adopting only inserted frames (instead of sweeping the whole
+// window) must still catch frames landing anywhere but the end, and string
+// HTML at unknown positions. Runs listed, where adoption leaves the guard's
+// marker behind. javascript:false frames get no guard copy of their own, so
+// only the page's adoption can mark them.
+async function frameAdoption() {
+  console.log("\n=== Inserted frames are adopted anywhere (issue 13) ===");
+  await page.goto(`${LISTED}/index.html`, { waitUntil: "load" });
+  await page.waitForTimeout(300);
+  const adopted = await page.evaluate(async () => {
+    const marked = (f) => { try { return "__noNewTabsGuard" in f.contentWindow; } catch { return false; } };
+    const mid = document.createElement("iframe");
+    mid.src = "javascript:false";
+    document.documentElement.insertBefore(mid, document.documentElement.firstChild);
+    document.body.insertAdjacentHTML("afterbegin", `<iframe src="javascript:false" id="adopt-string"></iframe>`);
+    await new Promise((r) => setTimeout(r, 300));
+    const out = [marked(mid), marked(document.getElementById("adopt-string"))];
+    mid.remove();
+    document.getElementById("adopt-string")?.remove();
+    return out;
+  });
+  report("insertBefore at the top is adopted", adopted[0] === true);
+  report("string HTML frame is adopted", adopted[1] === true);
 }
 
 // Plain-http sites are not secure contexts, so some APIs are missing there.
@@ -1159,6 +1188,7 @@ try {
   for (const [name, ok] of await sanity(LISTED, true)) report(name, ok);
   await mode("Control site (127.0.0.1, not listed)", UNLISTED, false, false);
   await unlistedIsUntouched();
+  await frameAdoption();
   await insecureSite();
   await pictureInPicture();
   await userTabsSurvive();
