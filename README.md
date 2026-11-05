@@ -117,7 +117,12 @@ There are two layers.
      `window.open` was wrapped don't go looking for another way out.
    - mostly uses built-in functions it saved before any page script ran, so
      a page can't steer it by replacing `Set.prototype.has`,
-     `Function.prototype.apply` and the like.
+     `Function.prototype.apply` and the like. Option and descriptor
+     objects handed to the browser have no prototype (a poisoned
+     `Object.prototype.signal` or `capture` is not inherited), argument
+     copies are written as own properties (a setter on
+     `Array.prototype[1]` cannot swallow them), and a listener that throws
+     cancels the event instead of letting the tab through.
 
    Nothing else is changed. The site's scripts, click handlers, `fetch`,
    video playback and downloads keep working. So does every open that stays
@@ -1163,23 +1168,25 @@ browser's own.
 steered or broken.
 
 **What it does.** At startup the guard saves everything it will use later:
-`Reflect.apply`, `Object.defineProperty`, the string methods, the
-WeakMap/WeakSet/WeakRef methods, `Array.prototype.push`,
-`add/removeEventListener`, the Node, Element, Document and Event methods
-and accessors, and the window accessors (`name`, `length`, `origin`,
-`frameElement`, `top`) ([guard.js:31-82](extension/guard.js#L31-L82)).
-After that it calls these saved copies for the checks that decide whether
-an open, click or submit opens a new context. A few steps still read live,
-page-visible properties: `win.Function` at install and in `relisten`
-([guard.js:300](extension/guard.js#L300),
-[guard.js:307](extension/guard.js#L307)), `win.MutationObserver` and its
-`observe`/`disconnect` ([guard.js:578-587](extension/guard.js#L578-L587)),
-`win.DOMException` when refusing picture-in-picture
-([guard.js:506](extension/guard.js#L506)), `startContainer` when finding a
-`Range`'s window ([guard.js:539](extension/guard.js#L539)), `el.contentWindow`
-for `<frame>` and `<object>` ([guard.js:593](extension/guard.js#L593)) and
-the `{ once: true }` options object in `later()`
-([guard.js:609](extension/guard.js#L609)). See [Known gaps](#known-gaps).
+`Reflect.apply`, `Object.defineProperty`, `Object.keys`, the string
+methods, the WeakMap/WeakSet/WeakRef methods, `add/removeEventListener`,
+the Node, Element, Document and Event methods and accessors, and the
+window accessors (`name`, `length`, `origin`, `frameElement`, `top`)
+([guard.js:36-99](extension/guard.js#L36-L99)). Array appends go through
+`defineProperty` instead of `Array.prototype.push`, and option and
+descriptor objects handed to the browser are copied to a null prototype,
+so poisoned `Object.prototype` or `Array.prototype` members are never
+consulted. After that it calls these saved copies for the checks that
+decide whether an open, click or submit opens a new context. A few steps
+still read live, page-visible properties: `win.Function` at install and in
+`relisten` (with a fallback that matches the record by window when the
+page replaced `Function`), `win.MutationObserver` and its
+`observe`/`disconnect`, `win.DOMException` when refusing
+picture-in-picture, `el.contentWindow` for `<frame>` and `<object>`, and
+each realm's own `Range.prototype.startContainer` getter (never the
+`Node.prototype` property a page can shadow) when finding a `Range`'s
+window ([guard.js:571-581](extension/guard.js#L571-L581)). See
+[Known gaps](#known-gaps).
 
 **Why not the obvious way.** The capture only counts because it happens
 before any page script runs. The same code run later would capture the
@@ -1238,13 +1245,13 @@ such as `map` or `forEach` can be replaced outright; a page can change
 either.
 
 **What it does.** After startup the guard uses index loops only: `each()`
-and `find()` are plain `for (i < length)` loops
-([guard.js:78-80](extension/guard.js#L78-L80),
-[guard.js:238-241](extension/guard.js#L238-L241)). `frameNamed` keeps a
-manual stack with `stack[stack.length] = child` and `stack.length--`
-([guard.js:151-162](extension/guard.js#L151-L162)). `readArgs` fills
-`out[i]` directly. Index writes to fresh arrays still look up setters on
-`Array.prototype`; see [Known gaps](#known-gaps).
+and `find()` are plain `for (i < length)` loops. `frameNamed` keeps a
+manual stack and `readArgs` fills a fresh array, but both write through
+`ownIndex()`, which defines own data properties instead of assigning, so
+a swallowing setter on `Array.prototype` cannot eat an index
+([guard.js:174-191](extension/guard.js#L174-L191),
+[guard.js:231-235](extension/guard.js#L231-L235)). Appends to the guard's
+own lists go through the same `defineProperty` path.
 
 **Why not the obvious way.** The rule is about when code runs, not about
 syntax. The startup block uses `.map`, destructuring and `for…of` because no
@@ -1486,7 +1493,7 @@ outer page's elements: `frameForm.submit.call(outerForm)`.
 **What it does.** `install(win)` reads everything from the target window
 (`win.Function.prototype`, `win.Document.prototype`,
 `win.HTMLFormElement.prototype`, `win.MutationObserver`, …) and patches it
-([guard.js:305-683](extension/guard.js#L305-L683)). `state`, `nativeOf` and
+([guard.js:335-739](extension/guard.js#L335-L739)). `state`, `nativeOf` and
 the decision helpers are shared by all realms.
 
 **Why not the obvious way.** Patching only the top window leaves every
@@ -1556,7 +1563,7 @@ real page loads.
 **What it does.** Inserting the frame (or reading `contentWindow`) adopts the
 `about:blank` realm at once. When `child.html` loads into the same realm,
 its own `guard.js` finds the marker and backs off, leaving the parent's
-patches ([guard.js:305-311](extension/guard.js#L305-L311)). The saved
+patches ([guard.js:335-341](extension/guard.js#L335-L341)). The saved
 wrapper resolves bare calls to the frame's own window (`this ?? win`).
 
 **Why not the obvious way.** Without the back-off, two guard copies would
@@ -1729,7 +1736,7 @@ window) and middle-click all open new contexts. Downloads must still work.
 
 **What it does.** `onActivate` is a capture listener on the window for
 `click` and `auxclick`, so it runs before page handlers
-([guard.js:623-657](extension/guard.js#L623-L657)). It returns early if the
+([guard.js:659-697](extension/guard.js#L659-L697)). It returns early if the
 event is already `defaultPrevented` (handled further out, which avoids
 double handling between window and shadow-root listeners). It takes the
 first link in the saved `composedPath`, so the innermost link wins. A link
@@ -1752,7 +1759,7 @@ anything.
 **What it does.** When a click or submit does not open a new context yet,
 `later()` adds a one-time non-capture listener on the window for the same
 event type. It runs after the target and bubble-phase handlers and re-runs
-the same check ([guard.js:601-612](extension/guard.js#L601-L612)). `ev === e`
+the same check ([guard.js:638-656](extension/guard.js#L638-L656)). `ev === e`
 ignores a different event of the same type. A `setTimeout(0)` removes the
 listener if the page stopped propagation.
 
@@ -2118,7 +2125,7 @@ says otherwise.
 | Call the frame's `open` on the main window: `savedOpen.call(window, url)` | Wrapper judges from `this ?? win` and checks `state.armed` at call time ([guard.js:379-386](extension/guard.js#L379-L386)) | "iframe open saved, .call(window)" |
 | `window.open = iframe.contentWindow.open` | Locked accessor returns `guarded(value)` for any native ([guard.js:403-417](extension/guard.js#L403-L417)) | "window.open = iframe's open" |
 | Before input, make a hidden frame's native `open` the page's `window.open` | Parser-inserted frames are adopted before the next script; accessor guards natives | "window.open = frame's native, at load" |
-| Plant a fake `__noNewTabsGuard` marker on a frame so the guard skips it | Adoption runs first: the MutationObserver adopts parser-inserted frames before the next script ([guard.js:575-587](extension/guard.js#L575-L587)), so the guard's own marker is already in place and a marker planted later changes nothing ([guard.js:305-311](extension/guard.js#L305-L311)) | "frame pre-marked as guarded" |
+| Plant a fake `__noNewTabsGuard` marker on a frame so the guard skips it | Adoption runs first: the MutationObserver adopts parser-inserted frames before the next script ([guard.js:575-587](extension/guard.js#L575-L587)), so the guard's own marker is already in place and a marker planted later changes nothing ([guard.js:335-341](extension/guard.js#L335-L341)) | "frame pre-marked as guarded" |
 | `frames[name].open` on a frame made with `document.write` | `write` wrappers sweep afterwards; observer catches parser insertion ([guard.js:434-438](extension/guard.js#L434-L438)) | "frames[name].open, document.write" |
 | `javascript:false` frame inside a closed shadow root (out of reach of `frames[n]`) | The `contentWindow` getter adopts the frame when the page reads it ([guard.js:512-531](extension/guard.js#L512-L531)) | "shadow-root jsf iframe" |
 | `javascript:false` frame inside another one | `sweep()` recurses; each adopted realm wraps its own insertion methods | "nested jsf iframe" |
@@ -2182,26 +2189,11 @@ In these cases the in-page guard misses the open, and the background closes
 the new tab a moment later.
 
 - **Brief flashes** are still possible when the page:
-  - defines a setter on `Array.prototype[0]` and similar, which `readArgs`
-    and `frameNamed` trigger when they write to a new array index
-    ([guard.js:161](extension/guard.js#L161),
-    [guard.js:207](extension/guard.js#L207));
-  - defines `signal` or `capture` getters on `Object.prototype`, which
-    `addEventListener` reads from the `{ once: true }` options object in
-    `later()` ([guard.js:609](extension/guard.js#L609));
-  - defines `startContainer` on `Node.prototype` or `Object.prototype`
-    (from reading the code). The insertion wrappers read it as a plain
-    property to tell a `Range` from a node
-    ([guard.js:537-542](extension/guard.js#L537-L542)), so they then sweep
-    the wrong window or none, and a frame reached through `window[n]` on
-    the next line is not yet adopted;
-  - replaces `window.Function` and then calls `document.open()` (or writes
-    after load) (from reading the code). `relisten` finds the realm's
-    listeners through `win.Function`
-    ([guard.js:296-303](extension/guard.js#L296-L303)), so the guard's
-    click, submit and input listeners are not re-added. Only the
-    arm/unlisted control listeners come back;
-  - exhausts the stack just before the guard's saved calls;
+  - exhausts the stack just before the guard's saved calls. The guard's
+    listeners fail closed when they run at all, but under exhaustion the
+    browser may not run them in the first place, so the tab can still
+    open. The suite covers this with a test that asserts the background
+    closes the tab;
   - uses the short gap before a same-origin frame is adopted at load;
   - or has a listed iframe on an unlisted page after a back/forward round
     trip.
@@ -2216,7 +2208,7 @@ the new tab a moment later.
   propagation beats both of the guard's checks. So does a handler inside a
   shadow root that changes the target, because the late check listens on
   the window, which `submit` events and non-composed clicks never reach
-  ([guard.js:601-612](extension/guard.js#L601-L612)).
+  ([guard.js:638-656](extension/guard.js#L638-L656)).
 - **A page capture listener could stop the arm signal** (from reading the
   code). The guard's control listeners are not capture listeners
   ([guard.js:124-127](extension/guard.js#L124-L127)), so a page listener on

@@ -20,7 +20,10 @@
 //   checks don't send ad scripts looking for another way out;
 // - only uses built-ins it saved before any page script ran, so a page
 //   can't steer it by replacing Set.prototype.has, Function.prototype.apply,
-//   Event.prototype.composedPath and the like.
+//   Event.prototype.composedPath and the like;
+// - hands the browser only null-prototype options and descriptors, writes
+//   array copies as own properties, and fails closed if a listener throws,
+//   so prototype poisoning and stack exhaustion don't open tabs either.
 
 (() => {
   "use strict";
@@ -40,10 +43,23 @@
   const charAt = uncurry(String.prototype.charCodeAt);
   const strSlice = uncurry(String.prototype.slice);
   const strIndex = uncurry(String.prototype.indexOf);
+  const { keys: objKeys } = Object; // takes its argument, not `this`: must not go through uncurry
+  // A hostile page can poison Object.prototype (signal, capture, ...) or
+  // Array.prototype (a swallowing setter), so objects the guard hands to
+  // the browser and array copies it inspects must not consult any
+  // prototype: options and descriptors get a null prototype, and index
+  // writes become own data properties.
+  const nullProto = (o) => { const n = { __proto__: null }; each(objKeys(o), (k) => { n[k] = o[k]; }); return n; };
+  const ownIndex = (arr, i, value) => defineProperty(arr, i, { value, writable: true, enumerable: true, configurable: true });
   const [wmGet, wmSet, wmHas, wmDelete] = ["get", "set", "has", "delete"].map((k) => uncurry(WeakMap.prototype[k]));
   const [wsAdd, wsHas] = ["add", "has"].map((k) => uncurry(WeakSet.prototype[k]));
   const deref = uncurry(WeakRef.prototype.deref);
-  const push = uncurry(Array.prototype.push);
+  // Appends without consulting Array.prototype: a swallowing setter the
+  // page defined there must not eat the guard's own bookkeeping.
+  const push = (list, value) => {
+    defineProperty(list, list.length, { value, writable: true, enumerable: true, configurable: true });
+    return list.length;
+  };
   const addListener = uncurry(EventTarget.prototype.addEventListener);
   const removeListener = uncurry(EventTarget.prototype.removeEventListener);
   const nodeType = getter(Node.prototype, "nodeType");
@@ -96,7 +112,7 @@
   function wrap(native, replacement) {
     wmSet(nativeOf, replacement, native);
     each(["name", "length"], (key) => {
-      try { defineProperty(replacement, key, { value: native[key], configurable: true }); } catch {}
+      try { defineProperty(replacement, key, nullProto({ value: native[key], configurable: true })); } catch {}
     });
     return replacement;
   }
@@ -114,7 +130,7 @@
   // Only arm.js can arm or remove the guard: it hands over a secret before
   // any page script runs.
   let secret = null;
-  addListener(window, "__no_new_tabs_hello__", (e) => { secret ??= `${e.detail}`; }, { once: true });
+  addListener(window, "__no_new_tabs_hello__", (e) => { secret ??= `${e.detail}`; }, nullProto({ once: true }));
   const detailGet = getter(CustomEvent.prototype, "detail");
   const fromArmJs = (e) => { try { return secret !== null && detailGet(e) === secret; } catch { return false; } };
   // Arm-only: nothing can switch it back off without a reload.
@@ -135,7 +151,7 @@
   // a no-op on an intact document. Not part of undo: uninstalling must
   // not remove it.
   const MutationObserverC = MutationObserver;
-  new MutationObserverC(() => listenControl()).observe(document, { childList: true });
+  new MutationObserverC(() => listenControl()).observe(document, nullProto({ childList: true }));
 
   function arm() {
     state.armed = true;
@@ -168,7 +184,7 @@
       for (let i = 0; i < n; i++) {
         let child;
         try { child = w[i]; } catch { continue; }
-        if (child) stack[stack.length] = child;
+        if (child) ownIndex(stack, stack.length, child);
       }
     }
     return false;
@@ -214,7 +230,7 @@
   // and "_blank" to the browser.
   function readArgs(args) {
     const out = [];
-    for (let i = 0; i < args.length; i++) out[i] = i < 2 && args[i] != null ? `${args[i]}` : args[i];
+    for (let i = 0; i < args.length; i++) ownIndex(out, i, i < 2 && args[i] != null ? `${args[i]}` : args[i]);
     return out;
   }
 
@@ -303,11 +319,15 @@
 
   // After document.open() or a write that replaces the document, the
   // browser drops every listener on the window and document: add ours back.
+  // The record is keyed by the realm's Function, which a page can replace,
+  // so fall back to matching the window itself.
   function relisten(doc) {
     try {
       const win = defaultView(doc);
       if (!win) return;
-      wmGet(records, win.Function)?.relisten();
+      const hit = wmGet(records, win.Function);
+      if (hit) hit.relisten();
+      else forEachRecord((rec) => { if (rec.win === win) rec.relisten(); });
       if (win === window) listenControl();
     } catch {}
   }
@@ -322,6 +342,7 @@
     const undo = [];
     const listeners = [];
     const rec = {
+      win,
       undo,
       lock: () => {},
       relisten: () => each(listeners, (l) => addListener(l[0], l[1], l[2], true)),
@@ -332,12 +353,13 @@
     // Replace obj[key] (described by desc) with value; undo puts the
     // original back if it is still ours.
     const patch = (obj, key, value, desc = { value, writable: true, configurable: true }) => {
+      desc = nullProto(desc);
       const before = ownDesc(obj, key);
       defineProperty(obj, key, desc);
       push(undo, () => {
         const now = ownDesc(obj, key);
         if (now && now.value === desc.value && now.get === desc.get && now.set === desc.set) {
-          if (before) defineProperty(obj, key, before);
+          if (before) defineProperty(obj, key, nullProto(before));
           else delete obj[key];
         }
       });
@@ -420,9 +442,9 @@
           set open(value) { current = value; },
         }, "open");
         wmSet(nativeOf, get, nativeOpen);
-        try { defineProperty(win, "open", { get, set, enumerable: true, configurable: false }); } catch {}
+        try { defineProperty(win, "open", nullProto({ get, set, enumerable: true, configurable: false })); } catch {}
       }
-      try { defineProperty(win, MARK, { configurable: false }); } catch {}
+      try { defineProperty(win, MARK, nullProto({ configurable: false })); } catch {}
     };
     if (state.armed) rec.lock();
 
@@ -544,9 +566,14 @@
     // before the call returns.
     const FRAME_SELECTOR = "iframe, frame, object, embed";
     const hasFrame = (n) => isElement(n) && (matches(n, FRAME_SELECTOR) || !!elQuery(n, FRAME_SELECTOR));
+    // A page can shadow startContainer on Node.prototype, so only trust
+    // each realm's own Range getter, and only on a real Range of that realm.
+    let rangeStart = null;
+    try { rangeStart = getter(win.Range.prototype, "startContainer"); } catch {}
     const viewOfTarget = (self) => {
       try {
-        const node = self.startContainer ?? self; // a Range, or a node
+        let node = self;
+        if (rangeStart) { try { node = rangeStart(self) ?? self; } catch { node = self; } }
         return nodeType(node) === 9 ? defaultView(node) : viewOf(node);
       } catch { return null; }
     };
@@ -593,7 +620,7 @@
         sweep(win);
       }
     });
-    observer.observe(win.document, { childList: true, subtree: true });
+    observer.observe(win.document, nullProto({ childList: true, subtree: true }));
     push(undo, () => observer.disconnect());
     listen(win.document, "load", (e) => {
       try {
@@ -610,49 +637,61 @@
     //    target, so look again once they have.
     const later = (e, opensNow, what, url) => {
       const late = (ev) => {
-        if (ev === e && state.armed && !defaultPrevented(e) && opensNow()) {
-          preventDefault(e);
-          log(what, url());
+        try {
+          if (ev === e && state.armed && !defaultPrevented(e) && opensNow()) {
+            preventDefault(e);
+            log(what, url());
+          }
+        } catch {
+          // Out of stack (or worse): cancel rather than let the tab through.
+          try { preventDefault(e); } catch {}
         }
       };
       const type = evType(e);
-      addListener(win, type, late, { once: true });
+      addListener(win, type, late, nullProto({ once: true }));
       // Not left behind if the page stops the event before it gets back here.
       setTimer(() => removeListener(win, type, late), 0);
     };
+    // Fail closed: if the guard itself throws while examining an event
+    // (stack exhaustion is the known way), cancel it rather than let the
+    // tab through. preventDefault cannot come first: that would cancel
+    // every benign click too.
     function onActivate(e) {
       if (!state.armed || defaultPrevented(e)) return; // handled further out
+      try {
+        const path = composedPath(e);
+        const type = evType(e);
+        const modifier = ctrlKey(e) || metaKey(e) || shiftKey(e);
+        // A script can dispatch a "click" with button 1, which the browser
+        // treats as a middle click. later() reuses opens() below, so this
+        // covers the re-check too.
+        const middle = button(e) === 1 && (type === "auxclick" || type === "click");
 
-      const path = composedPath(e);
-      const type = evType(e);
-      const modifier = ctrlKey(e) || metaKey(e) || shiftKey(e);
-      // A script can dispatch a "click" with button 1, which the browser
-      // treats as a middle click. later() reuses opens() below, so this
-      // covers the re-check too.
-      const middle = button(e) === 1 && (type === "auxclick" || type === "click");
-
-      const link = find(path, isLink);
-      if (link) {
-        if (hasAttr(link, "download") && !middle && !modifier) return;
-        const opens = () => middle || (type === "click" && (modifier || opensNew(linkTarget(link), viewOf(link))));
-        if (opens()) {
-          preventDefault(e);
-          log("link", linkUrl(link));
-        } else if (type === "click") {
-          later(e, opens, "link", () => linkUrl(link));
+        const link = find(path, isLink);
+        if (link) {
+          if (hasAttr(link, "download") && !middle && !modifier) return;
+          const opens = () => middle || (type === "click" && (modifier || opensNew(linkTarget(link), viewOf(link))));
+          if (opens()) {
+            preventDefault(e);
+            log("link", linkUrl(link));
+          } else if (type === "click") {
+            later(e, opens, "link", () => linkUrl(link));
+          }
+          return;
         }
-        return;
-      }
 
-      // A submit button: ctrl/shift/middle-click opens the result in a new
-      // tab, and so does a form aimed at one. onSubmit sees most of those,
-      // but not a form in a shadow root the browser built from HTML: its
-      // submit event never gets out to a listener of ours.
-      const submit = find(path, isSubmit);
-      const form = submit && formOf(submit);
-      if (form && (middle || modifier || (type === "click" && unheard(form) && opensNew(formTarget(form, submit), viewOf(form))))) {
-        preventDefault(e);
-        log("form submit", formUrl(form));
+        // A submit button: ctrl/shift/middle-click opens the result in a new
+        // tab, and so does a form aimed at one. onSubmit sees most of those,
+        // but not a form in a shadow root the browser built from HTML: its
+        // submit event never gets out to a listener of ours.
+        const submit = find(path, isSubmit);
+        const form = submit && formOf(submit);
+        if (form && (middle || modifier || (type === "click" && unheard(form) && opensNew(formTarget(form, submit), viewOf(form))))) {
+          preventDefault(e);
+          log("form submit", formUrl(form));
+        }
+      } catch {
+        try { preventDefault(e); } catch {}
       }
     }
 
@@ -660,12 +699,16 @@
     function onSubmit(e) {
       const form = evTarget(e);
       if (!state.armed || !isElement(form) || localName(form) !== "form") return;
-      const opens = () => opensNew(formTarget(form, submitterOf(e)), viewOf(form));
-      if (opens()) {
-        preventDefault(e);
-        log("form submit", formUrl(form));
-      } else {
-        later(e, opens, "form submit", () => formUrl(form));
+      try {
+        const opens = () => opensNew(formTarget(form, submitterOf(e)), viewOf(form));
+        if (opens()) {
+          preventDefault(e);
+          log("form submit", formUrl(form));
+        } else {
+          later(e, opens, "form submit", () => formUrl(form));
+        }
+      } catch {
+        try { preventDefault(e); } catch {}
       }
     }
 
