@@ -383,8 +383,55 @@ function waitForNavSource(tabId) {
 // trusted with the checks in arm.js: a word-long selection, loaded and
 // unlinked images, and no synthetic activation of its own after the menu.
 const squash = (s) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+// Brave's "Go to <address>" opens the selection itself, which has no query
+// string for the search rule to match. Accept the tab when its host and
+// path equal the selection parsed as a URL, with http:// added to bare
+// hosts. The comparison is exact (not contains) and case-insensitive, so a
+// selection of "example.com/a" never matches "example.com.evil/b".
+function urlFromSelection(sel) {
+  const t = String(sel ?? "").trim();
+  if (!t || t.length < 3 || t.length > 500) return null;
+  if (/\s/.test(t)) return null; // "Go to" offers a single address token
+  let cand = t;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(cand)) {
+    const bare = cand.match(/^([\w-]+(?:\.[\w-]+)*)(:\d+)?(\/\S*)?$/u);
+    // A bare word with no dot, port or path is a search term, not an
+    // address ("hello"); with one of those it is ("localhost:8799/x").
+    if (!bare || (!bare[1].includes(".") && !bare[2] && !(bare[3] && bare[3].length > 1))) return null;
+    cand = `http://${cand}`;
+  }
+  try {
+    const u = new URL(cand);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return u;
+  } catch {
+    return null;
+  }
+}
+function goToMatch(selection, url) {
+  const selUrl = urlFromSelection(selection);
+  if (!selUrl) return false;
+  let tabUrl;
+  try {
+    tabUrl = new URL(url);
+  } catch {
+    return false;
+  }
+  if (tabUrl.protocol !== "http:" && tabUrl.protocol !== "https:") return false;
+  const normHost = (h) => h.toLowerCase().replace(/\.$/, "");
+  if (normHost(selUrl.hostname) !== normHost(tabUrl.hostname)) return false;
+  const normPort = (u) => (!u.port || u.port === "80" || u.port === "443" ? "" : u.port);
+  if (normPort(selUrl) !== normPort(tabUrl)) return false;
+  const normPath = (u) => {
+    let p = u.pathname || "/";
+    if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
+    return (p + u.search + u.hash).toLowerCase();
+  };
+  return normPath(selUrl) === normPath(tabUrl);
+}
 function offeredByMenu(menu, url) {
   if (menu.srcs.includes(url)) return true;
+  if (goToMatch(menu.selection, url)) return true;
   const words = squash(menu.selection).slice(0, 50);
   if (words.length < 3) return false;
   try {
