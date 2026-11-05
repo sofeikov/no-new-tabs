@@ -828,7 +828,7 @@ the selection is read from the focused input or textarea, because the
 Selection API does not see text selected inside form fields. The background
 keys the record by `sender.tab.id`, which comes from the browser, keeps at
 most 20 string `srcs` and 500 characters of selection, and stamps the time
-([background.js:655-666](extension/background.js#L655-L666)).
+([background.js:662-673](extension/background.js#L662-L673)).
 
 **Why not the obvious way.** A page can dispatch a synthetic `contextmenu`,
 so `isTrusted` is required. Running in the isolated world means page changes
@@ -845,7 +845,7 @@ page-opened tab right after cannot match its leftovers.
 send `contextMenuClosed` ([arm.js:163-172](extension/arm.js#L163-L172), [arm.js:207-211](extension/arm.js#L207-L211)). While
 a native context menu is open the page receives neither, so the first one
 means the menu has closed. The background deletes the record
-([background.js:670-672](extension/background.js#L670-L672)).
+([background.js:677-679](extension/background.js#L677-L679)).
 
 **Why not the obvious way.** `pointermove` looks like the quickest "user is
 back" signal, but moving the pointer does not close a menu. Moves around the
@@ -860,17 +860,18 @@ site's own links opened in new tabs must stay blocked, even right after a
 context menu.
 
 **What it does.** `fromUserMenu` runs only after the source is found to be
-listed ([background.js:592-594](extension/background.js#L592-L594)). It needs
+listed ([background.js:599-601](extension/background.js#L599-L601)). It needs
 `born.get(tabId).url`, which exists only for browser-made tabs. It needs a
 menu record for the source tab less than 300 s old. `offeredByMenu` then
-accepts the URL if it equals one of the reported `srcs`, if it is the
+accepts the URL — what the tab was born with, or what the navigation event
+names (a ctrl-clicked tab carries no address at creation) — if it equals one of the reported `srcs`, if it is the
 selected address itself (Brave's "Go to <address>": the selection parsed
 as a URL, with `http://` added to bare hosts, compared against the tab's
 host and path exactly — not as a substring — and case-insensitively), or
 if the selection, whitespace-collapsed, lowercased and cut to 50
 characters (and not empty), appears in a decoded query-parameter value of
 the URL. On a match the record is deleted: one tab per menu
-([background.js:546-583](extension/background.js#L546-L583)).
+([background.js:550-590](extension/background.js#L550-L590)).
 
 **Why not the obvious way.** A page-made tab has no address at creation, so
 a page can never use the exemption by calling `window.open`. An empty
@@ -891,7 +892,7 @@ for …" on text in a PDF on a listed site has no menu record.
 hold: the source frame is not the top frame; the URL matches `SEARCH`; the
 URL is not itself listed; the tab's recorded history has no entry for that
 frame id; and `getAllFrames` does not list it (the browser's own internal
-frame) ([background.js:576-583](extension/background.js#L576-L583)).
+frame) ([background.js:583-590](extension/background.js#L583-L590)).
 `SEARCH` is anchored at `^https://`, allows an optional `www.`, a fixed
 list of engines (Google and Yandex on any 2–3 letter top-level domain, and
 Google also with a 2-letter second part such as `.co.uk`) and their search
@@ -2300,11 +2301,11 @@ them.
   though you chose them:
   - (Brave only) "Search for …" on text selected inside a PDF. Brave records
     the PDF viewer's frames like normal frames, so the PDF rule
-    ([background.js:576-583](extension/background.js#L576-L583)) never
+    ([background.js:583-590](extension/background.js#L583-L590)) never
     fires.
-- **Test coverage.** No test checks that a context-menu tab the user chose
-  is kept: the suite only checks that a menu is reported, that it ends on
-  the next click, and that it does not let a page-opened tab through. The
+- **Test coverage.** Menu-chosen tabs are kept and the fakes are refused
+  ("menu search/image tab is kept", "second tab from one menu is closed",
+  "synthetic contextmenu is not recorded"). The
   history-pruning code (the 60 s `left` expiry and the 1000-entry cap,
   [background.js:286-311](extension/background.js#L286-L311)) has no direct
   test either.
