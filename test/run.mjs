@@ -689,6 +689,33 @@ async function noSourceTabs() {
   report(`listed iframe open after back/forward is closed (nav: ${restored})`, !r.error && r.survived === 0, `(created ${r.created})`);
 }
 
+// Issue 10: every frame commit rewrote all history under one storage key.
+// Now rapid commits coalesce into one debounced write holding only the
+// changed tab's key. Runs background-only (content scripts not needed).
+async function storageWrites() {
+  console.log("\n=== Background storage writes (issue 10) ===");
+  const takeWrites = () => raw.swEval(`globalThis.__sessWrites.splice(0).map((k) => k.join(","))`);
+  await rawLoad(`${LISTED}/index.html`);
+  const tabId = await raw.swEval(`chrome.tabs.query({ url: "${LISTED}/index.html" }).then((t) => t[0]?.id)`);
+  await raw.swEval(`globalThis.__sessWrites = []; chrome.storage.onChanged.addListener((c, area) => { if (area === "session") globalThis.__sessWrites.push(Object.keys(c)); });`);
+  // Let the load's own save land before measuring.
+  for (let i = 0; i < 40; i++) {
+    const n = await raw.swEval(`globalThis.__sessWrites.length`);
+    await sleep(300);
+    if (await raw.swEval(`globalThis.__sessWrites.length`) === n) break;
+  }
+  await takeWrites();
+  await rp.eval(`(() => {
+    const f = document.createElement("iframe");
+    document.body.append(f);
+    return (async () => { for (let i = 0; i < 6; i++) { f.src = "/target.html?writecount=" + i; await new Promise((r) => setTimeout(r, 10)); } })();
+  })()`);
+  await sleep(600);
+  const writes = await takeWrites();
+  report("rapid frame commits coalesce into one write", writes.length === 1, `(${writes.length} writes)`);
+  report("only the changed tab's key is written", writes.length > 0 && writes.every((k) => k === `h.${tabId}`), `(${writes.join("; ")})`);
+}
+
 // What the user picks from a context menu opens a tab of their own, but a
 // context menu must not open the door for the page: a link click that gets
 // past the in-page guard right after one is still closed.
@@ -756,7 +783,7 @@ async function fakeMenuRecord() {
   await rp.click("#menu-realimg", { button: "right" });
   await sleep(400);
   const srcsReal = (await record())?.srcs ?? null;
-  report("loaded image is reported", Array.isArray(srcsReal) && srcsReal.some((u) => u.startsWith("data:")));
+  report("loaded image is reported once", Array.isArray(srcsReal) && srcsReal.length === 1 && srcsReal[0].includes("px.png?realimg"));
   await rp.click("#menu-sameimg", { button: "right" });
   await sleep(400);
   const srcsSame = (await record())?.srcs ?? null;
@@ -771,7 +798,13 @@ async function fakeMenuRecord() {
   await rp.click("#menu-closed-host", { button: "right" });
   await sleep(400);
   const srcsClosed = (await record())?.srcs ?? null;
-  report("closed-shadow image is reported", Array.isArray(srcsClosed) && srcsClosed.some((u) => u.includes("px.png?closed-shadow")));
+  report("closed-shadow image is reported once", Array.isArray(srcsClosed) && srcsClosed.length === 1 && srcsClosed[0].includes("px.png?closed-shadow"));
+  // Issue 10: data: URLs are skipped in the stored record — a photo inlined
+  // as base64 would blow the session-storage quota on its own.
+  await rp.click("#menu-dataimg", { button: "right" });
+  await sleep(400);
+  const srcsData = (await record())?.srcs ?? null;
+  report("data: image is not stored", Array.isArray(srcsData) && !srcsData.some((u) => u.startsWith("data:")));
   await rp.click("#menu-svg", { button: "right" });
   await sleep(400);
   const srcsSvg = (await record())?.srcs ?? null;
@@ -1155,6 +1188,7 @@ try {
   await workerRestart();
   await listedFrameInUnlistedPage();
   await noSourceTabs();
+  await storageWrites();
 
   await launchRawBrowser(bgOnly, ["--disable-popup-blocking"]);
   await popupChain();
