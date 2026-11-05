@@ -79,11 +79,15 @@ There are two layers.
      normally: **Search for the selected text** (also when the selection
      includes a link, or is inside a text box), **Open image in new tab**
      (also on a linked image) and **Open video in new tab**. The extension
-     notes what the menu offers when you right-click, and keeps a tab from
-     the menu only if its address is one of those, so a page can't use it.
-     **Open link in new tab** opens the site's link, so it is closed like
-     every other way the site's links open a tab. See
-     [Known gaps](#known-gaps) for menu items that are still closed.
+     notes what the menu offers when you right-click — the selection as it
+     stood before the button went down (at least 3 characters), and loaded
+     images that are not thumbnails linking to themselves — and keeps a tab
+     from the menu only if its address is one of those and the page sent no
+     synthetic click of its own afterwards, so a page can't use a faked
+     record to keep a tab it opened itself. **Open link in new tab** opens
+     the site's link, so it is closed like every other way the site's links
+     open a tab. See [Known gaps](#known-gaps) for menu items that are
+     still closed.
 2. **In-page guard** ([guard.js](extension/guard.js) +
    [arm.js](extension/arm.js)). This stops new tabs from being created at
    all, so you don't see one flash open and close. `guard.js` is injected
@@ -2225,16 +2229,6 @@ them.
     like an address.
   - "Open image in new tab" on images inside a closed shadow root or an SVG
     `<image>`. `arm.js` does not report those sources.
-- **A hostile page can still keep a tab open with a synthetic middle
-  click plus a faked context-menu record** (reproduced in headless Chromium
-  and headed Brave by a code review, not yet in the test suite): a
-  synthetic `click` `MouseEvent` with `button: 1` on a link can make the
-  browser open a background tab that already has its URL. The in-page guard
-  treats only `auxclick` as a middle click
-  ([guard.js:619](extension/guard.js#L619)). The tab counts as
-  browser-made, and with a text selection the page made itself it can match
-  the context-menu exemption, which checks only that the selection appears
-  in a query value ([background.js:270-278](extension/background.js#L270-L278)).
 - **Test coverage.** No test checks that a context-menu tab the user chose
   is kept: the suite only checks that a menu is reported, that it ends on
   the next click, and that it does not let a page-opened tab through. The

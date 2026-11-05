@@ -71,30 +71,98 @@
   // (search for the selected text, open an image or video) opens a tab of
   // their own, so the background lets that tab through: if its address is
   // one of those the menu offers. Opening the site's links in new tabs
-  // stays blocked. Pages can't fake these events, and this runs in the
-  // extension's own world, so the page can't change what it reads.
+  // stays blocked. This runs in the extension's own world, so the page
+  // can't change what it reads — but the selection and the images under
+  // the pointer can be arranged by the page, so the record carries only
+  // what the checks below allow.
   let menuOpen = false;
   const send = (msg) => chrome.runtime.sendMessage(msg).catch(() => {});
-  window.addEventListener("contextmenu", (e) => {
-    if (!armed || !e.isTrusted) return;
-    menuOpen = true;
-    const srcs = [];
-    for (const n of e.composedPath()) {
-      if (n instanceof HTMLImageElement || n instanceof HTMLMediaElement) srcs.push(n.currentSrc, n.src);
-      if (n instanceof HTMLMediaElement) for (const s of n.querySelectorAll("source[src]")) srcs.push(s.src);
-    }
+  const readSelection = () => {
     let selection = String(getSelection() ?? "");
     const field = document.activeElement;
     if (!selection && typeof field?.selectionStart === "number") {
       try { selection = field.value.slice(field.selectionStart, field.selectionEnd); } catch {}
     }
+    return selection;
+  };
+  // The selection as it was when the right button went down, before any
+  // mousedown handler of the page could replace it for the menu to offer.
+  let pressSelection = null;
+  const sameLink = (img) => {
+    try {
+      const a = img.closest("a");
+      if (!a || !a.href) return false;
+      const src = img.currentSrc || img.src;
+      return !!src && new URL(a.href, location.href).href === new URL(src, location.href).href;
+    } catch {
+      return false;
+    }
+  };
+  // Trusted input anywhere in the tab ends the menu: the user's next tab
+  // is their own only when picked straight from the menu. Every frame
+  // reports its own input; the record belongs to the whole tab. The right
+  // button itself never closes (it opens the menu instead).
+  window.addEventListener("pointerdown", (e) => {
+    if (!armed || !e.isTrusted) return;
+    if (e.button === 2) {
+      pressSelection = readSelection();
+      return;
+    }
+    menuOpen = false;
+    send({ type: "contextMenuClosed" });
+  }, true);
+  window.addEventListener("contextmenu", (e) => {
+    if (!armed || !e.isTrusted) return;
+    menuOpen = true;
+    const srcs = [];
+    const seenImgs = new Set();
+    for (const n of e.composedPath()) {
+      if (n instanceof HTMLMediaElement) {
+        srcs.push(n.currentSrc, n.src);
+        for (const s of n.querySelectorAll("source[src]")) srcs.push(s.src);
+      } else if (n instanceof HTMLImageElement && !seenImgs.has(n)) {
+        seenImgs.add(n);
+        // Only a loaded image counts, and not one wrapped in a link to the
+        // same address (a lightbox thumbnail: opening it is opening the
+        // site's link, which stays blocked).
+        let ok = false;
+        try {
+          ok = n.complete && n.naturalWidth > 0 && !sameLink(n);
+        } catch {
+          ok = false;
+        }
+        if (ok) srcs.push(n.currentSrc, n.src);
+      }
+    }
+    // The selection the user had when the button went down. A page that
+    // selects its own text on mousedown (for the menu to offer) finds an
+    // empty record instead. A keyboard-opened menu has no pointer press;
+    // that path is inherently genuine, so it keeps the live selection.
+    const now = readSelection();
+    const selection = pressSelection === null || now === pressSelection ? now : "";
+    pressSelection = null;
     send({ type: "contextMenu", selection, srcs: srcs.filter(Boolean) });
   }, true);
-  // Any click or key press in the page means the menu is gone (while it is
-  // open, the page gets neither).
-  for (const type of ["mousedown", "keydown"]) {
+  // A synthetic click the page dispatches itself (to open a tab matching
+  // the record above) voids the record: the background refuses the
+  // exemption for it. Genuine menu picks involve no page activation — the
+  // page gets no events while its menu is open.
+  for (const type of ["click", "auxclick"]) {
     window.addEventListener(type, (e) => {
-      if (!menuOpen || !e.isTrusted) return;
+      if (!armed || e.isTrusted) return;
+      send({ type: "untrustedActivation" });
+    }, true);
+  }
+  // A key press, a tab switch or a hidden tab in the menu's own frame
+  // means the menu is gone (while it is open, the page gets neither).
+  window.addEventListener("keydown", (e) => {
+    if (!menuOpen || !e.isTrusted) return;
+    menuOpen = false;
+    send({ type: "contextMenuClosed" });
+  }, true);
+  for (const type of ["blur", "visibilitychange"]) {
+    window.addEventListener(type, () => {
+      if (!menuOpen) return;
       menuOpen = false;
       send({ type: "contextMenuClosed" });
     }, true);
