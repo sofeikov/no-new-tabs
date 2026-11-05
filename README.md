@@ -106,7 +106,10 @@ There are two layers.
      `<iframe src="javascript:false">` frames that ad scripts (PopAds,
      Adcash) open popups from. Same-site frames are guarded the moment they
      are inserted, before the page can save their `open`. This includes
-     frames sandboxed without scripts.
+     frames sandboxed without scripts that stay readable (same-origin
+     or `allow-same-origin`). Opaque ones cannot be adopted; instead
+     `allow-popups` is stripped from their `sandbox` attribute before
+     they navigate, so the click does nothing.
    - cancels `target=_blank` links and forms, `<base target=_blank>`,
      `formtarget`, links and forms in shadow DOM, SVG links, and targets a
      page handler changes after the guard has looked.
@@ -642,7 +645,7 @@ input give `""` ([lib.js:25-42](extension/lib.js#L25-L42)).
 `""`, which would make a listed page's blob copy look unlisted. Only
 top-frame commits treat the two differently: a `null` host inherits the
 previous top-frame site (unless the user typed the address), while `""`
-stays unlisted ([background.js:118-124](extension/background.js#L118-L124)).
+stays unlisted ([background.js:278-282](extension/background.js#L278-L282)).
 `arm.js`'s `inListedTab` question uses the top-frame result too. In the
 frame walk both are falsy, so a subframe with either one defers to its
 parent: any frame under a listed frame counts as listed whatever its own
@@ -810,7 +813,7 @@ be able to use this as a loophole.
 
 **What it does.** A capture `contextmenu` listener in `arm.js` runs only
 when the frame is armed and `e.isTrusted`
-([arm.js:119-150](extension/arm.js#L119-L150)). It sends
+([arm.js:173-194](extension/arm.js#L173-L194)). It sends
 `{ type: "contextMenu", selection, srcs }`. `srcs` are the `currentSrc` and
 `src` of images and media along `e.composedPath()` (which crosses open
 shadow roots), plus `<source src>` children of media. Closed shadow trees
@@ -825,7 +828,7 @@ the selection is read from the focused input or textarea, because the
 Selection API does not see text selected inside form fields. The background
 keys the record by `sender.tab.id`, which comes from the browser, keeps at
 most 20 string `srcs` and 500 characters of selection, and stamps the time
-([background.js:353-361](extension/background.js#L353-L361)).
+([background.js:655-666](extension/background.js#L655-L666)).
 
 **Why not the obvious way.** A page can dispatch a synthetic `contextmenu`,
 so `isTrusted` is required. Running in the isolated world means page changes
@@ -839,10 +842,10 @@ alone would miss shadow-DOM images and the source the browser chose from
 page-opened tab right after cannot match its leftovers.
 
 **What it does.** Trusted `mousedown` and `keydown` in the capture phase
-send `contextMenuClosed` ([arm.js:110-118](extension/arm.js#L110-L118)). While
+send `contextMenuClosed` ([arm.js:163-172](extension/arm.js#L163-L172), [arm.js:207-211](extension/arm.js#L207-L211)). While
 a native context menu is open the page receives neither, so the first one
 means the menu has closed. The background deletes the record
-([background.js:362-365](extension/background.js#L362-L365)).
+([background.js:670-672](extension/background.js#L670-L672)).
 
 **Why not the obvious way.** `pointermove` looks like the quickest "user is
 back" signal, but moving the pointer does not close a menu. Moves around the
@@ -857,7 +860,7 @@ site's own links opened in new tabs must stay blocked, even right after a
 context menu.
 
 **What it does.** `fromUserMenu` runs only after the source is found to be
-listed ([background.js:307-310](extension/background.js#L307-L310)). It needs
+listed ([background.js:592-594](extension/background.js#L592-L594)). It needs
 `born.get(tabId).url`, which exists only for browser-made tabs. It needs a
 menu record for the source tab less than 300 s old. `offeredByMenu` then
 accepts the URL if it equals one of the reported `srcs`, if it is the
@@ -867,7 +870,7 @@ host and path exactly — not as a substring — and case-insensitively), or
 if the selection, whitespace-collapsed, lowercased and cut to 50
 characters (and not empty), appears in a decoded query-parameter value of
 the URL. On a match the record is deleted: one tab per menu
-([background.js:391-441](extension/background.js#L391-L441)).
+([background.js:546-583](extension/background.js#L546-L583)).
 
 **Why not the obvious way.** A page-made tab has no address at creation, so
 a page can never use the exemption by calling `window.open`. An empty
@@ -888,7 +891,7 @@ for …" on text in a PDF on a listed site has no menu record.
 hold: the source frame is not the top frame; the URL matches `SEARCH`; the
 URL is not itself listed; the tab's recorded history has no entry for that
 frame id; and `getAllFrames` does not list it (the browser's own internal
-frame) ([background.js:289-297](extension/background.js#L289-L297)).
+frame) ([background.js:576-583](extension/background.js#L576-L583)).
 `SEARCH` is anchored at `^https://`, allows an optional `www.`, a fixed
 list of engines (Google and Yandex on any 2–3 letter top-level domain, and
 Google also with a 2-letter second part such as `.co.uk`) and their search
@@ -1131,10 +1134,10 @@ become guarded at once, including hidden frames that already exist, even
 before any user input.
 
 **What it does.** `arm.js` listens to `chrome.storage.onChanged` and checks
-again ([arm.js:64-68](extension/arm.js#L64-L68)). `guard.js`'s `arm()` sets
+again ([arm.js:66-68](extension/arm.js#L66-L68)). `guard.js`'s `arm()` sets
 `armed`, clears `removed`, reinstalls into the window if it had removed
 itself, locks `window.open` in every realm, and sweeps every same-origin
-child frame ([guard.js:130-136](extension/guard.js#L130-L136)).
+child frame ([guard.js:175-181](extension/guard.js#L175-L181)).
 
 **Why not the obvious way.** Clearing `removed` is required because
 `install()` refuses to run while it is set. The sweep covers frames the page
@@ -1833,10 +1836,10 @@ all `submit` events never leave a shadow root.
 **What it does.** `Element.prototype.attachShadow` is wrapped. After the
 native call it adds capture `click`, `auxclick` and `submit` listeners to
 the returned root, closed roots included, and records the root in
-`listenedRoots` ([guard.js:666-675](extension/guard.js#L666-L675)).
+`listenedRoots` ([guard.js:912-919](extension/guard.js#L912-L919)).
 `unheard(node)` is true when the node's root is neither its document nor a
 listened root, for example a detached node or a declarative shadow root
-built by the parser ([guard.js:444-447](extension/guard.js#L444-L447)).
+built by the parser ([guard.js:590-593](extension/guard.js#L590-L593)).
 
 **Why not the obvious way.** Declarative roots (`<template shadowrootmode>`)
 never call `attachShadow`, so they stay unheard. The `click()`,
@@ -1961,16 +1964,16 @@ step for each property it replaces, `listen()` adds a
 `removeEventListener`, and the observer adds `disconnect()`.
 `uninstallAll()` runs each realm's list from last to first, each step in its
 own `try/catch`, then forgets the realm
-([guard.js:285-292](extension/guard.js#L285-L292),
-[guard.js:322-349](extension/guard.js#L322-L349)).
+([guard.js:462-488](extension/guard.js#L462-L488),
+[guard.js:418-424](extension/guard.js#L418-L424)).
 
 Exception: shadow roots the page attached before the guard was removed keep
 the guard's capture `click`, `auxclick` and `submit` listeners. The
 `attachShadow` wrapper adds them directly, not through `listen()`
-([guard.js:666-675](extension/guard.js#L666-L675)), so they are not on the
+([guard.js:912-919](extension/guard.js#L912-L919)), so they are not on the
 undo list. They do nothing while the guard is not armed (`onActivate` and
-`onSubmit` return at once, [guard.js:614](extension/guard.js#L614),
-[guard.js:649](extension/guard.js#L649)) and work again if the site is added
+`onSubmit` return at once, [guard.js:847-848](extension/guard.js#L847-L848),
+[guard.js:894-895](extension/guard.js#L894-L895)) and work again if the site is added
 later.
 
 **Why not the obvious way.** A guard that is merely disabled and left in
@@ -2179,9 +2182,9 @@ says otherwise.
 | Page handler sets `target=_blank` or `<base target=_blank>` after the guard looked | `later()` looks again after the page's handlers | `target set by a page click handler`, `<base target> set by a click handler`, `form target set by a submit handler` |
 | Links and forms in closed or declarative shadow roots, non-composed clicks | Listeners inside each `attachShadow` root; `unheard()` paths for declarative roots | "closed shadow root _blank link", "_blank form, declarative shadow root", ".click() in closed declarative shadow" |
 | `document.open()` the whole page, then a `_blank` link | Listeners re-added after `open`/`write` | "_blank after document.open() of page" |
-| Turn the page into a `blob:` copy, or a `blob:null` page via a sandboxed frame | `arm.js` checks `self.origin` (blob: copy) or asks the background for an opaque page (blob:null); the background inherits the previous site ([arm.js:44-50](extension/arm.js#L44-L50), [background.js:118-124](extension/background.js#L118-L124)) | "page turns itself into a blob: copy", "page becomes a blob:null page" |
+| Turn the page into a `blob:` copy, or a `blob:null` page via a sandboxed frame | `arm.js` checks `self.origin` (blob: copy) or asks the background for an opaque page (blob:null); the background inherits the previous site ([arm.js:42-50](extension/arm.js#L42-L50), [background.js:278-282](extension/background.js#L278-L282)) | "page turns itself into a blob: copy", "page becomes a blob:null page" |
 | `_blank` links in a `data:` frame | Injected via `match_origin_as_fallback`; `ancestorOrigins` | "_blank link in a data: frame" |
-| Use a no-script sandboxed frame's `open` or `form.submit` | Parent adopts it | "no-script sandbox frame's window.open", "… form.submit" |
+| Use a no-script sandboxed frame's `open` or `form.submit` | Parent adopts it when readable; opaque frames get `allow-popups` stripped instead | "no-script sandbox frame's window.open", "… form.submit" |
 | Fake the guard's `unlisted` or `arm` signals | Secret handshake; arm-only | "page fakes the 'unlisted' signal", "page faked 'unlisted' during load", "page fakes 'arm', then opens" |
 | Document picture-in-picture window | `requestWindow` rejected with `NotAllowedError` | "listed: refused" |
 | Argument whose `toString` changes between reads | `readArgs` converts once | (none) |
@@ -2225,6 +2228,11 @@ handled. Items marked "from reading the code" are not covered by tests.
 In these cases the in-page guard misses the open, and the background closes
 the new tab a moment later.
 
+- **Opaque script-less frames missed by the `allow-popups` strip.** The
+  strip runs at insertion, on load, and when the page sets the attribute —
+  but only once armed, so an opaque frame put in place before the arm
+  signal (or inside a subdocument at arm time) keeps `allow-popups`. A
+  real click there flashes a tab that the background then closes.
 - **Brief flashes** are still possible when the page:
   - exhausts the stack just before the guard's saved calls. The guard's
     listeners fail closed when they run at all, but under exhaustion the
@@ -2255,17 +2263,17 @@ the new tab a moment later.
   are still cancelled up front, so they are not affected.
 - **A page capture listener could stop the arm signal** (from reading the
   code). The guard's control listeners are not capture listeners
-  ([guard.js:124-127](extension/guard.js#L124-L127)), so a page listener on
+  ([guard.js:159-162](extension/guard.js#L159-L162)), so a page listener on
   `window` for `__no_new_tabs_arm__` that calls `stopImmediatePropagation()`
   could keep the guard from arming.
 - **Live arming of a page that was first found unlisted** (from reading the
   code). Natives the page saved while the guard was removed stay unguarded,
   and the reinstall reads globals the page may have replaced
-  ([guard.js:130-136](extension/guard.js#L130-L136)). Reloading the tab
+  ([guard.js:442-448](extension/guard.js#L442-L448)). Reloading the tab
   after adding a site avoids this.
 - **Sandboxed frames the guard can't recognise as sandboxed** (from reading
   the code). `isSandboxed` checks only the frame's own origin and its own
-  `sandbox` attribute ([guard.js:167-173](extension/guard.js#L167-L173)). A
+  `sandbox` attribute ([guard.js:231-237](extension/guard.js#L231-L237)). A
   frame sandboxed with `allow-same-origin` inside a cross-origin parent
   (where `frameElement` is null), or a frame nested inside such a sandbox,
   can name a sibling frame in `open()` and get past the in-page guard. The
@@ -2283,15 +2291,20 @@ them.
 
 - **In Brave, Open link in container and dragging a link onto the tab
   strip** get through on a listed site.
+- **Open link in private window** gets through on a listed site: the
+  extension is off in private windows unless it is allowed there, so the
+  new tab is never seen. Turn on **Allow in Private** (Brave) or **Allow
+  in Incognito** (Chrome) on the extension's Details page for coverage
+  there too.
 - **Context-menu items that are still closed on a listed site,** even
   though you chose them:
   - (Brave only) "Search for …" on text selected inside a PDF. Brave records
     the PDF viewer's frames like normal frames, so the PDF rule
-    ([background.js:289-297](extension/background.js#L289-L297)) never
+    ([background.js:576-583](extension/background.js#L576-L583)) never
     fires.
 - **Test coverage.** No test checks that a context-menu tab the user chose
   is kept: the suite only checks that a menu is reported, that it ends on
   the next click, and that it does not let a page-opened tab through. The
   history-pruning code (the 60 s `left` expiry and the 1000-entry cap,
-  [background.js:127-147](extension/background.js#L127-L147)) has no direct
+  [background.js:286-311](extension/background.js#L286-L311)) has no direct
   test either.
