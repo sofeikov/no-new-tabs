@@ -927,6 +927,33 @@ async function hardening() {
   report("replaced window.Function document.open()", !r.error && r.created === 0, `(created ${r.created})`);
 }
 
+// Issue 9: frames the guard can't reach. Dense same-process sampling
+// showed a navigating frame's fresh Window stays parent-unreadable until
+// load on this build, where the existing load listener adopts it in the
+// same dispatch — so item 1's poll-during-load race has no observable
+// window here and gets no test. Item 2 is observable and tested below:
+// an opaque frame holding a target=_blank link. Needs the popup blocker
+// off: the attacks use untrusted opens.
+async function unreachedFrames() {
+  console.log("\n=== Frames the guard can't reach (issue 9) ===");
+  // An opaque (sandboxed, no allow-same-origin) frame holding a
+  // target=_blank link: the parent can never adopt it, so its sandbox must
+  // not allow popups in the first place.
+  await rawLoad(`${LISTED}/index.html`);
+  let r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      const f = document.createElement("iframe");
+      f.id = "h-opaque";
+      f.setAttribute("sandbox", "allow-popups allow-forms");
+      f.src = "/opaque.html";
+      document.body.append(f);
+    })()`);
+    await sleep(800);
+    await rp.clickIn("#h-opaque", "a");
+  });
+  report("opaque sandbox _blank click", !r.error && r.created === 0, `(created ${r.created})`);
+}
+
 // Adding a site arms an open page, hidden frames included, even before any
 // input (needs the popup blocker off for the frame to open anything).
 async function liveArmNoInput() {
@@ -976,6 +1003,7 @@ try {
   await launchRawBrowser(EXT, ["--disable-popup-blocking"]);
   await liveArmNoInput();
   await hardening();
+  await unreachedFrames();
 
   console.log("\n##### Background layer only (no content scripts) #####");
   const bgOnly = backgroundOnlyCopy();

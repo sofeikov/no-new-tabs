@@ -1727,6 +1727,14 @@ adopts it like any same-origin child ([guard.js:247-251](extension/guard.js#L247
 Tests: "no-script sandbox frame's window.open / form.submit", "_blank link
 in a no-script sandbox frame".
 
+A frame with neither `allow-scripts` nor `allow-same-origin` has an opaque
+origin: the parent can never adopt it and no script runs in it, so a
+`target=_blank` link inside it would flash a tab. On listed pages the guard
+takes `allow-popups` out of such a frame's `sandbox` attribute — at
+insertion, on load, when the page is armed, and when the attribute is set
+afterwards — so the click does nothing instead of flashing. Test: "opaque
+sandbox _blank click".
+
 #### Links, forms and clicks
 
 ##### Link clicks: capture on the window
