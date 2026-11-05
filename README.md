@@ -2237,6 +2237,13 @@ the new tab a moment later.
 - **Page code that runs inside a DOM insertion** (a custom element's
   `connectedCallback`, an inserted `<script>`) can still reach a new frame's
   `window.open` before the guard does.
+- **Another extension's in-page UI frames.** Password managers and grammar
+  checkers inject `chrome-extension://` iframes where the guard can't run.
+  On a listed page, a tab opened from such a frame with a real click is
+  closed about 60 ms later: the tab arrives with no address and no
+  navigation source, so it is judged by the listing top page. Recording
+  those frames would not help without knowing which one was clicked, which
+  the background cannot see.
 - **Closed shadow roots written straight into HTML**
   (`<template shadowrootmode="closed">`): a click on a `_blank` link inside
   one gets past the in-page guard.

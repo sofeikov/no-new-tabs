@@ -85,6 +85,9 @@ const restored = chrome.storage.session.get(null)
     for (const tab of await chrome.tabs.query({}).catch(() => [])) {
       const entries = history.get(tab.id) ?? [];
       if (!entries.some((e) => e.f === 0 && e.seq === 0)) {
+        // No saved rows at all (e.g. a reload cleared session storage):
+        // moments before the first top-frame commit seen are unknown.
+        if (!entries.length) unknownTabs.add(tab.id);
         entries.unshift({ f: 0, p: -1, h: siteOf(tab.url || tab.pendingUrl || "") ?? "", t: 0, seq: 0 });
         history.set(tab.id, entries);
         touchTab(tab.id);
@@ -249,6 +252,8 @@ const isHttpUrl = (url) => {
 chrome.webNavigation.onCommitted.addListener((d) => {
   if (d.documentLifecycle === "prerender") return;
   if (d.frameId === 0) {
+    // History from here on is observed, so the unknown window is over.
+    unknownTabs.delete(d.tabId);
     if (!firstCommit.has(d.tabId)) {
       firstCommit.set(d.tabId, { transitionType: d.transitionType });
       setTimeout(() => firstCommit.delete(d.tabId), 10_000);
@@ -377,10 +382,17 @@ const liveFrames = async (tabId) => new Map(((await chrome.webNavigation.getAllF
 // Was this frame (or any frame above it) on a listed site at the given
 // moment? Frames that left or were removed since are judged by what they
 // were then.
+// Tabs whose history starts with a tabs.query seed (no saved rows, e.g.
+// after an extension reload cleared session storage). Moments before the
+// first top-frame commit seen for them are unknown, so popups from that
+// window are taken as listed. Memory-only: never persisted.
+const unknownTabs = new Set();
+
 async function frameWasListed(tabId, frameId, moment, domains) {
   const entries = history.get(tabId) ?? [];
   let live = null;
   for (let f = frameId ?? 0, hops = 0; hops < 32; hops++) {
+    if (f === 0 && unknownTabs.has(tabId)) return true;
     const e = entryAt(entries, f, moment);
     let host, parent;
     if (e) {
