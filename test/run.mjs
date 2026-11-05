@@ -745,6 +745,28 @@ async function storageWrites() {
   report("only the changed tab's key is written", writes.length > 0 && writes.every((k) => k === `h.${tabId}`), `(${writes.join("; ")})`);
 }
 
+// Issue 11: tabs open before an extension reload. Clearing session storage
+// (what a reload does) plus a worker stop restarts each tab from what it
+// shows now, with earlier moments unknown: a popup opened before the next
+// top commit is taken as listed, and judged normally after it.
+async function reloadEdge() {
+  console.log("\n=== Tabs open before an extension reload (issue 11) ===");
+  await rawLoad(`${LISTED}/index.html`);
+  // Tab-under: the listed tab moves to an unlisted page.
+  await rp.goto(`${UNLISTED}/index.html`);
+  await raw.swEval(`chrome.storage.session.clear()`);
+  await raw.stopSW();
+  // The popup wakes the worker; restore seeds the tab from what it shows.
+  // The decision itself waits for the restore.
+  const before = await rawCase(() => rp.eval(`void window.open("/target.html?case=reload-edge")`, { gesture: true }));
+  report("popup before the first commit after reload is closed", !before.error && before.survived === 0, `(created ${before.created})`);
+  // A top commit ends the unknown window: the same opener is judged by
+  // what it really shows.
+  await rp.goto(`${UNLISTED}/target.html?case=after-reload`);
+  const after = await rawCase(() => rp.eval(`void window.open("/target.html?case=reload-after")`, { gesture: true }));
+  report("popup after a top commit is judged normally", !after.error && after.survived === 1, `(created ${after.created})`);
+}
+
 // What the user picks from a context menu opens a tab of their own, but a
 // context menu must not open the door for the page: a link click that gets
 // past the in-page guard right after one is still closed.
@@ -1219,6 +1241,7 @@ try {
   await listedFrameInUnlistedPage();
   await noSourceTabs();
   await storageWrites();
+  await reloadEdge();
 
   await launchRawBrowser(bgOnly, ["--disable-popup-blocking"]);
   await popupChain();
