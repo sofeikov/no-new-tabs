@@ -377,25 +377,36 @@ function waitForNavSource(tabId) {
 
 // The user picked something from a context menu on a listed page: a
 // search for the selected text, or open an image or video. That one tab is
-// theirs, so it is kept, if the browser made it (a page can't create a tab
-// that comes with an address) and its address is one the menu offered.
-// Opening the site's links in new tabs stays blocked.
+// theirs, so it is kept, if its address is one the menu offered. Opening
+// the site's links in new tabs stays blocked. A page can open a tab that
+// already has an address with a synthetic click, so the record is only
+// trusted with the checks in arm.js: a word-long selection, loaded and
+// unlinked images, and no synthetic activation of its own after the menu.
 const squash = (s) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
 function offeredByMenu(menu, url) {
   if (menu.srcs.includes(url)) return true;
   const words = squash(menu.selection).slice(0, 50);
-  if (!words) return false;
+  if (words.length < 3) return false;
   try {
     for (const value of new URL(url).searchParams.values()) if (squash(value).includes(words)) return true;
   } catch {}
   return false;
 }
 
+// A synthetic activation the page dispatched itself may still be in
+// flight when the menu matches: give it a beat, then re-check the record
+// before trusting it.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const MENU_WINDOW_MS = 30_000;
+
 async function fromUserMenu(tabId, sourceTabId, sourceFrameId, domains) {
   const url = born.get(tabId)?.url;
   if (!url) return false;
   const menu = menus.get(sourceTabId);
-  if (menu && Date.now() - menu.t < 300_000 && offeredByMenu(menu, url)) {
+  if (menu && Date.now() - menu.t < MENU_WINDOW_MS && offeredByMenu(menu, url)) {
+    await sleep(50);
+    const fresh = menus.get(sourceTabId);
+    if (!fresh || fresh.voided || Date.now() - fresh.t >= MENU_WINDOW_MS || !offeredByMenu(fresh, url)) return false;
     menus.delete(sourceTabId); // one tab per menu
     persist();
     return true;
@@ -487,6 +498,16 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   }
   if (msg?.type === "contextMenuClosed" && id != null) {
     if (menus.delete(id)) persist();
+    return;
+  }
+  // The page dispatched a synthetic click itself after the menu: whatever
+  // tab it opens next is its own doing, not the user's menu pick.
+  if (msg?.type === "untrustedActivation" && id != null) {
+    const m = menus.get(id);
+    if (m && !m.voided) {
+      m.voided = true;
+      persist();
+    }
     return;
   }
   // arm.js asks this when it can't tell from inside the page: a frame whose

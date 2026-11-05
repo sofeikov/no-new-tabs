@@ -707,6 +707,66 @@ async function contextMenu() {
   report("a click in the page ends the menu", (await menus()) === 0);
 }
 
+// Issue 6: a page must not earn the menu exemption for a tab it opened
+// itself — neither with a selection it set during the gesture nor with a
+// synthetic click after a genuine-looking record.
+async function fakeMenuRecord() {
+  console.log("\n=== Faked context-menu record (issue 6) ===");
+  const record = () => raw.swEval(`chrome.storage.session.get("menus").then((s) => Object.values(s.menus ?? {})[0] ?? null)`);
+  // A. Selection set by the page during the right-button gesture is dropped.
+  await rawLoad(`${LISTED}/index.html`);
+  await rp.eval(`window.addEventListener("mousedown", () => {
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById("menu-attack"));
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+  }, true)`);
+  await rp.click("#menu-attack", { button: "right" });
+  await sleep(400);
+  report("gesture-time selection is dropped from the record", (await record())?.selection === "");
+  const atk = await rawCase(() => rp.eval(`(() => {
+    const doc = document.getElementById("jsf-static").contentDocument;
+    const a = doc.createElement("a");
+    a.href = "/target.html?case=menu-attack&q=zqxj attack selection words";
+    doc.body.append(a);
+    a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 1 }));
+  })()`, { gesture: true }));
+  report("faked-selection tab is closed", !atk.error && atk.survived === 0, `(created ${atk.created})`);
+  // B. A matching record is voided by the page's own synthetic click.
+  await rawLoad(`${LISTED}/index.html`);
+  await rp.eval(`(() => {
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById("menu-attack"));
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+  })()`);
+  await rp.click("#menu-attack", { button: "right" });
+  await sleep(400);
+  const selB = (await record())?.selection ?? "";
+  report("pre-existing selection is kept in the record", selB.includes("zqxj"));
+  const voided = await rawCase(() => rp.eval(`(() => {
+    const a = document.createElement("a");
+    a.href = "/target.html?case=menu-void&q=zqxj attack selection words";
+    document.body.append(a);
+    a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 1 }));
+  })()`, { gesture: true }));
+  report("synthetic click after a matching record is closed", !voided.error && voided.survived === 0, `(created ${voided.created})`);
+  // C. Only loaded, unlinked images are reported.
+  await rawLoad(`${LISTED}/index.html`);
+  await rp.click("#menu-realimg", { button: "right" });
+  await sleep(400);
+  const srcsReal = (await record())?.srcs ?? null;
+  report("loaded image is reported", Array.isArray(srcsReal) && srcsReal.some((u) => u.startsWith("data:")));
+  await rp.click("#menu-sameimg", { button: "right" });
+  await sleep(400);
+  const srcsSame = (await record())?.srcs ?? null;
+  report("same-link image is not reported", Array.isArray(srcsSame) && !srcsSame.some((u) => u.includes("samelink")));
+  await rp.click("#menu-broken", { button: "right" });
+  await sleep(400);
+  const srcsBroken = (await record())?.srcs ?? null;
+  report("broken image is not reported", Array.isArray(srcsBroken) && srcsBroken.length === 0);
+}
+
 // Adding a site arms an open page, hidden frames included, even before any
 // input (needs the popup blocker off for the frame to open anything).
 async function liveArmNoInput() {
@@ -750,6 +810,7 @@ try {
   await tabUnder();
   await workerRestart();
   await contextMenu();
+  await fakeMenuRecord();
   await launchRawBrowser(EXT, ["--disable-popup-blocking"]);
   await liveArmNoInput();
 
