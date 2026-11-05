@@ -121,6 +121,7 @@
     <button id="j-nested" onclick="__byName('jsfouter')[0].open('/target.html?case=j-nested')">nested jsf iframe</button>
     <button id="j-detached" onclick="const a = document.createElement('a'); a.href = '/target.html?case=j-detached'; a.target = '_blank'; a.click();">detached link .click()</button>
     <button id="j-dispatch" onclick="const a = document.createElement('a'); a.href = '/target.html?case=j-dispatch'; a.target = '_blank'; a.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));">detached link dispatchEvent</button>
+    <button id="j-jsf-blank" onclick="const doc = document.getElementById('jsf-static').contentDocument; const a = doc.createElement('a'); a.href = '/target.html?case=jsf-blank-click'; doc.body.append(a); a.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 1 })); a.remove();">synthetic middle-click in jsf frame (no navigation source)</button>
     <form id="form-main-blank" action="/target.html" target="_blank"><input type="hidden" name="case" value="j-form-realm"></form>
     <button id="j-form-realm" onclick="__byName('jsfstatic').HTMLFormElement.prototype.submit.call(document.getElementById('form-main-blank'))">form.submit from iframe realm</button>
   </section>

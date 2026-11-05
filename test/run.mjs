@@ -662,6 +662,33 @@ async function listedFrameInUnlistedPage() {
   }
 }
 
+// Issue 7: tabs that already have a URL and no navigation source
+// (javascript:false frames, back/forward-cache restores) must still be
+// judged by their opener. Runs background-only, where no guard hides them.
+async function noSourceTabs() {
+  console.log("\n=== Tabs with a URL and no navigation source (issue 7) ===");
+  await rawLoad(`${LISTED}/index.html`);
+  const jsf = await rawCase(() => rp.click("#j-jsf-blank"));
+  report("synthetic middle-click in jsf frame is closed", !jsf.error && jsf.survived === 0, `(created ${jsf.created})`);
+
+  // Listed iframe on an unlisted page, after a back/forward round trip: a
+  // plain window.open from the listed iframe has no source and must still
+  // be closed. If the page was not restored from cache, the exact source
+  // path already closes it, so this passes either way.
+  await rawLoad(`${UNLISTED}/index.html`);
+  await rp.click("#link-cross");
+  await sleep(300);
+  await rp.waitLoad();
+  await sleep(150);
+  await rp.eval(`history.back()`);
+  await sleep(500);
+  await rp.waitLoad();
+  await sleep(200);
+  const restored = await rp.eval(`performance.getEntriesByType("navigation").map((n) => n.type).join(",")`).catch(() => "");
+  const r = await rawCase(() => rawDriver().frameClick("xframe", "#frame-open"));
+  report(`listed iframe open after back/forward is closed (nav: ${restored})`, !r.error && r.survived === 0, `(created ${r.created})`);
+}
+
 // What the user picks from a context menu opens a tab of their own, but a
 // context menu must not open the door for the page: a link click that gets
 // past the in-page guard right after one is still closed.
@@ -734,6 +761,7 @@ try {
   await tabUnder();
   await workerRestart();
   await listedFrameInUnlistedPage();
+  await noSourceTabs();
 
   await launchRawBrowser(bgOnly, ["--disable-popup-blocking"]);
   await popupChain();

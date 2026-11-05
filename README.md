@@ -70,8 +70,11 @@ There are two layers.
      affected. Its own popups (such as a sign-in window) work.
    - Tabs you open yourself (Ctrl+T, Ctrl+N, the address bar, bookmarks,
      duplicate, reopen closed tab) are never closed. Tabs a page creates
-     start with no address at all, and the browser's own tabs always have
-     one. That is how the two are told apart.
+     usually start with no address at all; tabs that already have one (the
+     browser's middle- and ctrl-click tabs) are told apart by the new tab's
+     first navigation: user navigations (typed, bookmark, duplicate,
+     reopen) are kept, page links are closed. A popup with no navigation
+     source is judged by its opener, including restored pages.
    - What you pick from the right-click menu on a listed page opens
      normally: **Search for the selected text** (also when the selection
      includes a link, or is inside a text box), **Open image in new tab**
@@ -2202,20 +2205,11 @@ the new tab a moment later.
 
 ### Caught only by the in-page guard
 
-The in-page guard stops these, but the background layer alone misses them:
-
-- **Ctrl- or middle-click on a link inside a `javascript:false` frame**
-  whose content the page wrote (the frame need not be hidden). The browser
-  gives that tab an address from the start and sends no
-  `onCreatedNavigationTarget` for it, and only page-made tabs (no address)
-  go through the `tabs.onCreated` fallback
-  ([background.js:241](extension/background.js#L241),
-  [background.js:322](extension/background.js#L322)), so the worker never
-  judges it.
-- **Popups from a hidden frame inside a listed iframe on an unlisted page.**
-  The browser doesn't say which frame opened such a tab, and closing every
-  such popup of an unlisted page that embeds a listed site would break that
-  page's own popups, so the background judges the opener's page.
+No cases are currently known that only the guard catches. Tabs that already
+have an address (`javascript:false` frames, back/forward-cache restores)
+and popups with no navigation source from restored pages are now judged by
+the background layer too, closing with a brief flash when the guard misses
+them.
 
 ### Not handled
 
@@ -2231,22 +2225,16 @@ The in-page guard stops these, but the background layer alone misses them:
     like an address.
   - "Open image in new tab" on images inside a closed shadow root or an SVG
     `<image>`. `arm.js` does not report those sources.
-- **A hostile page can still keep a tab open in some cases** (reproduced
-  in headless Chromium and headed Brave by a code review, not yet in the
-  test suite):
-  1. A synthetic `click` `MouseEvent` with `button: 1` on a link can make
-     the browser open a background tab that already has its URL. The
-     in-page guard treats only `auxclick` as a middle click
-     ([guard.js:619](extension/guard.js#L619)). The tab counts as
-     browser-made, and with a text selection the page made itself it can
-     match the context-menu exemption, which checks only that the
-     selection appears in a query value
-     ([background.js:270-278](extension/background.js#L270-L278)).
-  2. When such a browser-made tab comes from a `javascript:false` frame, or
-     from a subframe of a page restored from the back/forward cache, Chrome
-     sends no `onCreatedNavigationTarget`, and the worker never judges it
-     (see the first item under
-     [Caught only by the in-page guard](#caught-only-by-the-in-page-guard)).
+- **A hostile page can still keep a tab open with a synthetic middle
+  click plus a faked context-menu record** (reproduced in headless Chromium
+  and headed Brave by a code review, not yet in the test suite): a
+  synthetic `click` `MouseEvent` with `button: 1` on a link can make the
+  browser open a background tab that already has its URL. The in-page guard
+  treats only `auxclick` as a middle click
+  ([guard.js:619](extension/guard.js#L619)). The tab counts as
+  browser-made, and with a text selection the page made itself it can match
+  the context-menu exemption, which checks only that the selection appears
+  in a query value ([background.js:270-278](extension/background.js#L270-L278)).
 - **Test coverage.** No test checks that a context-menu tab the user chose
   is kept: the suite only checks that a menu is reported, that it ends on
   the next click, and that it does not let a page-opened tab through. The
