@@ -126,6 +126,16 @@
     addListener(window, "__no_new_tabs_unlisted__", onUnlisted);
   };
   listenControl();
+  // document.open() drops every listener on the window and document, and
+  // relisten() only runs while installed: after the guard removed itself on
+  // an unlisted page, a rewrite would drop these control listeners for
+  // good, so a later arm signal (the site was added to the list) would
+  // never be heard. Observers survive document.open(), so keep one that
+  // puts the control listeners back even while uninstalled. Re-adding is
+  // a no-op on an intact document. Not part of undo: uninstalling must
+  // not remove it.
+  const MutationObserverC = MutationObserver;
+  new MutationObserverC(() => listenControl()).observe(document, { childList: true });
 
   function arm() {
     state.armed = true;

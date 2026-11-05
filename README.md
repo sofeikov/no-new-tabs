@@ -1678,11 +1678,17 @@ listeners `arm.js` signals through.
 
 **What it does.** `document.open`, `write` and `writeln` are wrapped. In a
 `finally` block the wrapper calls `relisten(this)` and `sweepFrom(this)`
-([guard.js:431-438](extension/guard.js#L431-L438)). `relisten` finds the
+([guard.js:441-446](extension/guard.js#L441-L446)). `relisten` finds the
 realm's record and re-adds every listener recorded by `listen()`, plus the
 control listeners for the guard's own window
-([guard.js:294-303](extension/guard.js#L294-L303)). `sweepFrom` adopts
-frames the written HTML created.
+([guard.js:306-313](extension/guard.js#L306-L313)). `sweepFrom` adopts
+frames the written HTML created. Two rewrites the wrappers cannot cover
+are handled by observers, which survive `document.open()`: `arm.js`
+re-runs its menu reporting setup, and the guard puts its control
+listeners back even while uninstalled, so a rewritten unlisted page still
+hears a later arm signal. Tests: "menu reported after document.open()",
+"menu reported in rewritten iframe", "rewritten unlisted page arms when
+listed".
 
 **Why not the obvious way.** `addEventListener` ignores a listener already
 registered with the same type, callback and capture, so calling `relisten`
