@@ -55,7 +55,7 @@ function backgroundOnlyCopy() {
 }
 
 // --- static server -------------------------------------------------------
-const types = { ".html": "text/html", ".json": "application/json", ".js": "text/javascript" };
+const types = { ".html": "text/html", ".json": "application/json", ".js": "text/javascript", ".png": "image/png" };
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const path = url.pathname;
@@ -765,6 +765,21 @@ async function fakeMenuRecord() {
   await sleep(400);
   const srcsBroken = (await record())?.srcs ?? null;
   report("broken image is not reported", Array.isArray(srcsBroken) && srcsBroken.length === 0);
+  // D. Images composedPath() hides (issue 3): closed shadow root, SVG
+  // <image> and <input type=image>. elementFromPoint() still finds the
+  // host; the fix steps into the root and collects the new element types.
+  await rp.click("#menu-closed-host", { button: "right" });
+  await sleep(400);
+  const srcsClosed = (await record())?.srcs ?? null;
+  report("closed-shadow image is reported", Array.isArray(srcsClosed) && srcsClosed.some((u) => u.includes("px.png?closed-shadow")));
+  await rp.click("#menu-svg", { button: "right" });
+  await sleep(400);
+  const srcsSvg = (await record())?.srcs ?? null;
+  report("SVG image is reported", Array.isArray(srcsSvg) && srcsSvg.some((u) => u.includes("px.png?svg")));
+  await rp.click("#menu-inputimg", { button: "right" });
+  await sleep(400);
+  const srcsInput = (await record())?.srcs ?? null;
+  report("input image is reported", Array.isArray(srcsInput) && srcsInput.some((u) => u.includes("px.png?input")));
 }
 
 // Issue 4: document.open() drops every listener on the window and document,

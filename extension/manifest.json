@@ -6,7 +6,8 @@
   "permissions": [
     "tabs",
     "webNavigation",
-    "storage"
+    "storage",
+    "dom"
   ],
   "host_permissions": [
     "<all_urls>"

@@ -88,15 +88,68 @@
   // The selection as it was when the right button went down, before any
   // mousedown handler of the page could replace it for the menu to offer.
   let pressSelection = null;
-  const sameLink = (img) => {
+  const sameLink = (el, src) => {
     try {
-      const a = img.closest("a");
+      const a = el.closest("a");
       if (!a || !a.href) return false;
-      const src = img.currentSrc || img.src;
       return !!src && new URL(a.href, location.href).href === new URL(src, location.href).href;
     } catch {
       return false;
     }
+  };
+  // Image addresses the menu may offer for one element. The browser
+  // offers "open image" for plain images, SVG <image> and image buttons
+  // alike. Only loaded, unlinked images count: a lightbox thumbnail opens
+  // the site's link, which stays blocked.
+  const imgSrcs = (n) => {
+    if (n instanceof HTMLMediaElement) {
+      const out = [n.currentSrc, n.src];
+      try { for (const s of n.querySelectorAll("source[src]")) out.push(s.src); } catch {}
+      return out;
+    }
+    if (n instanceof HTMLImageElement) {
+      let ok = false;
+      try {
+        ok = n.complete && n.naturalWidth > 0;
+      } catch {
+        ok = false;
+      }
+      const src = n.currentSrc || n.src;
+      return ok && src && !sameLink(n, src) ? [n.currentSrc, n.src] : [];
+    }
+    if (typeof SVGImageElement !== "undefined" && n instanceof SVGImageElement) {
+      let href = "";
+      try { href = new URL(n.href?.baseVal ?? n.getAttribute("href") ?? "", document.baseURI).href; } catch {}
+      return href && !sameLink(n, href) ? [href] : [];
+    }
+    if (n instanceof HTMLInputElement && n.type === "image") {
+      const src = n.src || "";
+      return src && !sameLink(n, src) ? [src] : [];
+    }
+    return [];
+  };
+  // The elements under a trusted pointer, walking out through open and
+  // closed shadow trees. composedPath() hides closed-tree internals even
+  // from the isolated world, and elementFromPoint() retargets to the
+  // host — so step in with openOrClosedShadowRoot (needs the "dom"
+  // permission) and hit-test each root again. A keyboard-opened menu has
+  // no pointer position (0, 0); that path keeps composedPath() only, so
+  // a stray top-left image never joins the record.
+  const underPointer = (x, y) => {
+    const chain = [];
+    if (!x && !y) return chain;
+    let el = null;
+    try { el = document.elementFromPoint(x, y); } catch { return chain; }
+    const seen = new Set();
+    while (el && !seen.has(el)) {
+      seen.add(el);
+      chain.push(el);
+      let root = null;
+      try { root = el.shadowRoot ?? chrome.dom?.openOrClosedShadowRoot?.(el) ?? null; } catch { root = null; }
+      if (!root) break;
+      try { el = root.elementFromPoint(x, y); } catch { break; }
+    }
+    return chain;
   };
   // Trusted input anywhere in the tab ends the menu: the user's next tab
   // is their own only when picked straight from the menu. Every frame
@@ -120,25 +173,16 @@
       if (!armed || !e.isTrusted) return;
       menuOpen = true;
       const srcs = [];
-      const seenImgs = new Set();
-      for (const n of e.composedPath()) {
-        if (n instanceof HTMLMediaElement) {
-          srcs.push(n.currentSrc, n.src);
-          for (const s of n.querySelectorAll("source[src]")) srcs.push(s.src);
-        } else if (n instanceof HTMLImageElement && !seenImgs.has(n)) {
-          seenImgs.add(n);
-          // Only a loaded image counts, and not one wrapped in a link to the
-          // same address (a lightbox thumbnail: opening it is opening the
-          // site's link, which stays blocked).
-          let ok = false;
-          try {
-            ok = n.complete && n.naturalWidth > 0 && !sameLink(n);
-          } catch {
-            ok = false;
-          }
-          if (ok) srcs.push(n.currentSrc, n.src);
-        }
-      }
+      const seen = new Set();
+      const take = (n) => {
+        if (!n || seen.has(n)) return;
+        seen.add(n);
+        for (const u of imgSrcs(n)) srcs.push(u);
+      };
+      for (const n of e.composedPath()) take(n);
+      // Nodes inside a closed shadow tree never appear above; walk out
+      // from the element under the pointer instead.
+      for (const n of underPointer(e.clientX, e.clientY)) take(n);
       // The selection the user had when the button went down. A page that
       // selects its own text on mousedown (for the menu to offer) finds an
       // empty record instead. A keyboard-opened menu has no pointer press;
