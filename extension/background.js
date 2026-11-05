@@ -44,14 +44,21 @@ const menus = new Map(); // tabId -> { link, t }
 // Closed tabs are forgotten 30 s later; their opener may need judging until then.
 const gone = new Map(); // tabId -> when it was closed
 
+// Tabs whose current top page was restored from the back/forward cache.
+// A restored page's subframes never re-commit, so history alone misses
+// them; a popup with no navigation source counts as listed while the
+// restored page is current if any recorded frame of that page was listed.
+const restoredTabs = new Set(); // tabId
+
 // left: when the frame's page was left (a later top-frame commit).
 const pack = (entries) => entries.map(({ f, p, h, t, left }) => [f, p, h, t, left ?? 0]);
 const unpack = (rows) => rows.map(([f, p, h, t, left]) => ({ f, p, h, t, seq: 0, ...(left ? { left } : {}) }));
 
-const restored = chrome.storage.session.get(["spawned", "history", "trimmed", "menus", "gone"])
+const restored = chrome.storage.session.get(["spawned", "history", "trimmed", "menus", "gone", "restoredTabs"])
   .then((saved) => {
     (saved.spawned ?? []).forEach((id) => spawned.add(id));
     (saved.trimmed ?? []).forEach((id) => trimmed.add(id));
+    (saved.restoredTabs ?? []).forEach((id) => restoredTabs.add(id));
     for (const [id, m] of Object.entries(saved.menus ?? {})) if (!menus.has(+id)) menus.set(+id, m);
     for (const [id, at] of Object.entries(saved.gone ?? {})) if (!gone.has(+id)) gone.set(+id, at);
     // Saved entries predate everything this worker has seen (seq 0).
@@ -86,12 +93,13 @@ function persist() {
       spawned: [...spawned].slice(-500),
       history: saved,
       trimmed: [...trimmed],
+      restoredTabs: [...restoredTabs].slice(-500),
       menus: Object.fromEntries(menus),
       gone: Object.fromEntries(gone),
     }).catch((e) => {
       // Never leave an old record behind to be restored later.
       console.warn("[no-new-tabs] could not save history:", e?.message);
-      if (write === writes) chrome.storage.session.remove(["history", "trimmed"]).catch(() => {});
+      if (write === writes) chrome.storage.session.remove(["history", "trimmed", "restoredTabs"]).catch(() => {});
     });
   }), 0);
 }
@@ -103,6 +111,7 @@ function forgetGone() {
     for (const m of [history, menus, gone]) m.delete(id);
     spawned.delete(id);
     trimmed.delete(id);
+    if (restoredTabs.delete(id)) persist();
   }
 }
 
@@ -111,8 +120,59 @@ function forgetGone() {
 // there.
 const USER_TRANSITIONS = new Set(["typed", "auto_bookmark", "generated", "keyword", "keyword_generated", "start_page", "auto_toplevel"]);
 
+// A new tab's first top commit tells user tabs apart from page tabs.
+// Duplicate and reopen use "reload" (history API): for a new tab that is
+// the user's own doing, unlike a reload inside an existing tab.
+const NEW_TAB_USER_TRANSITIONS = new Set([...USER_TRANSITIONS, "reload"]);
+
+// The first top-frame commit seen for a new tab, by tab id.
+const firstCommit = new Map(); // tabId -> { transitionType }
+const commitWaiters = new Map(); // tabId -> resolve
+const COMMIT_WAIT_MS = 3000;
+function waitForFirstCommit(tabId) {
+  if (firstCommit.has(tabId)) return Promise.resolve(firstCommit.get(tabId));
+  if (commitWaiters.has(tabId)) return commitWaiters.get(tabId).promise;
+  let resolve;
+  const promise = new Promise((res) => { resolve = res; });
+  const timer = setTimeout(() => {
+    commitWaiters.delete(tabId);
+    resolve(null);
+  }, COMMIT_WAIT_MS);
+  commitWaiters.set(tabId, {
+    promise,
+    resolve: (v) => { clearTimeout(timer); commitWaiters.delete(tabId); resolve(v); },
+  });
+  return promise;
+}
+
+const isHttpUrl = (url) => {
+  try {
+    const p = new URL(url).protocol;
+    return p === "http:" || p === "https:";
+  } catch {
+    return false;
+  }
+};
+
 chrome.webNavigation.onCommitted.addListener((d) => {
   if (d.documentLifecycle === "prerender") return;
+  if (d.frameId === 0) {
+    if (!firstCommit.has(d.tabId)) {
+      firstCommit.set(d.tabId, { transitionType: d.transitionType });
+      setTimeout(() => firstCommit.delete(d.tabId), 10_000);
+    }
+    const waiter = commitWaiters.get(d.tabId);
+    if (waiter) waiter.resolve({ transitionType: d.transitionType });
+    const restoredNow = (d.transitionQualifiers ?? []).includes("forward_back");
+    if (restoredNow) {
+      if (!restoredTabs.has(d.tabId)) {
+        restoredTabs.add(d.tabId);
+        persist();
+      }
+    } else if (restoredTabs.delete(d.tabId)) {
+      persist();
+    }
+  }
   const entries = history.get(d.tabId) ?? [];
   const parent = d.frameId === 0 ? -1 : d.parentFrameId;
   let h = siteOf(d.url);
@@ -136,16 +196,48 @@ chrome.webNavigation.onCommitted.addListener((d) => {
     }
   }
   const last = lastOf(entries, d.frameId);
-  if (last && last.h === h && last.p === parent && last.left == null) return; // same site as before
-  entries.push({ f: d.frameId, p: parent, h, t: d.timeStamp, seq: now });
-  if (entries.length > MAX_ENTRIES) {
-    // Drop the oldest frame entry. Top-frame entries go last, and only
-    // after 1000 changes of site.
-    const sub = entries.findIndex((e) => e.f !== 0);
-    entries.splice(Math.max(sub, 0), 1);
-    if (sub < 0) trimmed.add(d.tabId);
+  if (last && last.h === h && last.p === parent && last.left == null) {
+    if (d.frameId !== 0 || !(d.transitionQualifiers ?? []).includes("forward_back")) return;
+    // A cache restore with no visible change still needs its live subframes.
+  } else {
+    entries.push({ f: d.frameId, p: parent, h, t: d.timeStamp, seq: now });
+    if (entries.length > MAX_ENTRIES) {
+      // Drop the oldest frame entry. Top-frame entries go last, and only
+      // after 1000 changes of site.
+      const sub = entries.findIndex((e) => e.f !== 0);
+      entries.splice(Math.max(sub, 0), 1);
+      if (sub < 0) trimmed.add(d.tabId);
+    }
   }
   persist();
+  if (d.frameId === 0 && (d.transitionQualifiers ?? []).includes("forward_back")) {
+    // Subframes restored from the back/forward cache never re-commit, so
+    // record what is live now for the no-source fallback below.
+    const tabId = d.tabId;
+    const stamp = d.timeStamp;
+    liveFrames(tabId).then((live) => {
+      if (!live?.size) return;
+      const list = history.get(tabId) ?? [];
+      let changed = false;
+      for (const [frameId, f] of live) {
+        if (frameId === 0) continue;
+        const host = siteOf(f.url);
+        if (host === "") continue;
+        const cur = lastOf(list, frameId);
+        if (cur && cur.h === host && cur.left == null) continue;
+        list.push({ f: frameId, p: f.parentFrameId ?? 0, h: host, t: stamp, seq: ++seq });
+        changed = true;
+      }
+      if (changed) {
+        while (list.length > MAX_ENTRIES) {
+          const sub = list.findIndex((e) => e.f !== 0);
+          list.splice(Math.max(sub, 0), 1);
+          if (sub < 0) trimmed.add(tabId);
+        }
+        persist();
+      }
+    }).catch(() => {});
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -225,6 +317,27 @@ async function wasListed(tabId, frameId, moments, domains) {
   return false;
 }
 
+// No navigation source names a frame (the opener frame never committed, or
+// the opener page was restored from the back/forward cache). Judge the
+// opener's top page; while a restored page is current, any listed frame in
+// it counts, since the opener frame itself is unknown.
+async function openerWasListed(openerTabId, moment, domains) {
+  if (await wasListed(openerTabId, 0, [moment], domains)) return true;
+  if (!restoredTabs.has(openerTabId)) return false;
+  const entries = history.get(openerTabId) ?? [];
+  const frames = new Set(entries.map((e) => e.f));
+  for (const f of frames) {
+    if (await frameWasListed(openerTabId, f, moment, domains)) return true;
+  }
+  // The refresh after a cache restore may still be in flight: look live.
+  try {
+    for (const [, f] of await liveFrames(openerTabId)) {
+      if (f.frameId !== 0 && hostIsBlocked(siteOf(f.url), domains)) return true;
+    }
+  } catch {}
+  return false;
+}
+
 function block(tabId, why) {
   spawned.add(tabId);
   persist();
@@ -234,10 +347,11 @@ function block(tabId, why) {
 
 // --- Close anything a listed site opens ----------------------------------
 
-// A tab created by page script (window.open, target=_blank, forms) arrives
-// with no URL at all. Tabs the user opens (Ctrl+T, address bar, bookmarks,
-// restore, duplicate) always carry a pendingUrl or a url, so they never
-// match. openerTabId alone is not enough: Ctrl+T sets it too.
+// A tab created by page script (window.open, target=_blank, forms) usually
+// arrives with no URL at all. Tabs that already carry a pendingUrl or url
+// are the browser's own (middle- and ctrl-click, "Open link in new tab"):
+// the page's or the user's. Telling those apart needs the new tab's first
+// commit (see NEW_TAB_USER_TRANSITIONS); openerTabId alone is not enough.
 const pageCreated = (tab) => tab.openerTabId != null && !tab.pendingUrl && !tab.url;
 
 // What tabs.onCreated saw: the address the tab came with (only tabs the
@@ -319,7 +433,10 @@ chrome.tabs.onCreated.addListener((tab) => {
     born.set(tab.id, { url: tab.pendingUrl || tab.url, atSeq });
     setTimeout(() => born.delete(tab.id), 10_000);
   }
-  if (!pageCreated(tab) || decisions.has(tab.id)) return; // navigation event came first
+  if (decisions.has(tab.id)) return; // navigation event came first
+  const bornUrl = tab.pendingUrl || tab.url;
+  const urlBorn = tab.openerTabId != null && !!bornUrl;
+  if (!pageCreated(tab) && !(urlBorn && isHttpUrl(bornUrl))) return;
   const nav = waitForNavSource(tab.id); // register synchronously, before any await
   track(tab.id, (async () => {
     const source = await nav;
@@ -327,8 +444,17 @@ chrome.tabs.onCreated.addListener((tab) => {
     const domains = await getDomains();
     if (!domains.length) return false;
     await restored;
+    if (!pageCreated(tab)) {
+      // A tab that already has an address: the user's own (typed,
+      // bookmark, duplicate, reopen) or the page's link. The first commit
+      // tells them apart; without a commit, keep the tab.
+      const commit = await waitForFirstCommit(tab.id);
+      if (!commit) return false;
+      if (commit.transitionType && NEW_TAB_USER_TRANSITIONS.has(commit.transitionType)) return false;
+      if (await fromUserMenu(tab.id, tab.openerTabId, undefined, domains)) return false;
+    }
     // The browser doesn't say which frame: judge the opener's page.
-    const listed = await wasListed(tab.openerTabId, 0, [{ atSeq }], domains);
+    const listed = await openerWasListed(tab.openerTabId, { atSeq }, domains);
     if (listed) block(tab.id, `opened by tab ${tab.openerTabId} (no navigation source)`);
     return listed;
   })());
