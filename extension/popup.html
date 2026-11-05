@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 260px; margin: 12px; color: #222; }
+    .host { font-weight: 600; word-break: break-all; margin: 4px 0 8px; }
+    .status { margin-bottom: 10px; }
+    .on { color: #c62828; font-weight: 600; }
+    button { width: 100%; padding: 7px; font: inherit; cursor: pointer; }
+    a { display: block; margin-top: 10px; color: #555; }
+  </style>
+</head>
+<body>
+  <div>Current site</div>
+  <div class="host" id="host">…</div>
+  <div class="status" id="status"></div>
+  <button id="toggle" hidden></button>
+  <a href="options.html" target="_blank">Edit the domain list</a>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

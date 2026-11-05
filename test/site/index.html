@@ -1,0 +1,211 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>No New Tabs — test page</title>
+  <script>
+    window.__savedOpen = window.open;
+    // Before arm.js answers, window.open must still look like the browser's.
+    window.__openWasData = "value" in Object.getOwnPropertyDescriptor(window, "open");
+    window.__savedAppend = Node.prototype.appendChild;
+  </script>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 24px; }
+    section { margin-bottom: 14px; }
+    button, a { margin: 2px 6px 2px 0; }
+    iframe { border: 1px solid #999; width: 420px; height: 70px; }
+  </style>
+</head>
+<body>
+  <h1>New-tab test page</h1>
+  <p>Every control below tries to open a new tab or window. On a blocked site none of them should.</p>
+
+  <section>
+    <button id="btn-open" onclick="window.__ret = window.open('/target.html?case=open')">window.open()</button>
+    <button id="btn-open-blank" onclick="window.__ret = window.open('')">window.open('')</button>
+    <button id="btn-saved-open" onclick="window.__savedOpen('/target.html?case=saved')">window.open saved at load</button>
+    <button id="btn-popup" onclick="window.open('/target.html?case=popup', 'pop', 'width=400,height=300')">popup window</button>
+    <button id="btn-docopen" onclick="document.open('/target.html?case=docopen', '_blank', '')">document.open(url, name, features)</button>
+  </section>
+
+  <section>
+    <a id="link-blank" href="/target.html?case=blank" target="_blank">target=_blank</a>
+    <a id="link-noopener" href="/target.html?case=noopener" target="_blank" rel="noopener noreferrer">noopener</a>
+    <a id="link-named" href="/target.html?case=named-window" target="someWindow">target=someWindow</a>
+    <a id="link-plain" href="/target.html?case=plain">plain link (ctrl/shift/middle-click)</a>
+    <button id="btn-js-click" onclick="const a = document.createElement('a'); a.href = '/target.html?case=jsclick'; a.target = '_blank'; document.body.append(a); a.click(); a.remove();">script-made _blank link .click()</button>
+  </section>
+
+  <section>
+    <form id="form-blank" action="/target.html" target="_blank">
+      <input type="hidden" name="case" value="form">
+      <button id="btn-form" type="submit">form target=_blank</button>
+    </form>
+    <form id="form-plain" action="/target.html">
+      <input type="hidden" name="case" value="form-plain">
+      <button id="btn-form-plain" type="submit">plain form (ctrl-click)</button>
+    </form>
+    <button id="btn-form-js" onclick="document.getElementById('form-blank').submit()">form.submit() on _blank form</button>
+  </section>
+
+  <section>
+    <button id="btn-iframe-trick" onclick="
+      const f = document.createElement('iframe');
+      document.body.append(f);
+      f.contentWindow.open('/target.html?case=iframe-trick');">
+      bypass attempt: fresh iframe's window.open</button>
+  </section>
+
+  <section>
+    <p>Cross-origin iframe (different host):</p>
+    <iframe id="xframe"></iframe>
+    <p>Nested: other-host frame inside other-host frame, like an ad inside a video player:</p>
+    <iframe id="xframe-nested"></iframe>
+    <script>
+      // Embed the other host: localhost <-> 127.0.0.1.
+      const other = location.hostname === "localhost" ? "127.0.0.1" : "localhost";
+      document.getElementById("xframe").src = `http://${other}:${location.port}/frame.html`;
+      document.getElementById("xframe-nested").src = `http://${other}:${location.port}/nest.html`;
+    </script>
+  </section>
+
+  <section>
+    <h2>Real ad-script tricks (PopAds, Adcash, borghcc on 720pstream.cx)</h2>
+    <!-- A javascript:false iframe never commits a document, so the browser
+         injects no content scripts into it and its window.open is native. -->
+    <iframe id="jsf-static" name="jsfstatic" src="javascript:false" style="display:none"></iframe>
+    <script>
+      // Parse-time document.write, then only ever reached by name.
+      document.write('<iframe name="jsfdw" src="javascript:false" style="display:none"></iframe>');
+      // PopAds: insert at load, keep contentWindow (and its open) for later.
+      const pop = document.createElement("iframe");
+      pop.src = "javascript:false";
+      pop.style.display = "none";
+      document.body.insertBefore(pop, document.body.firstChild);
+      window.__popWin = pop.contentWindow;
+      window.__popOpen = window.__popWin.open;
+      // Adcash: a no-src iframe whose open is bound at load.
+      const ac = document.createElement("iframe");
+      ac.style.display = "none";
+      document.body.append(ac);
+      window.__boundOpen = ac.contentWindow.open.bind(ac.contentWindow);
+      // A javascript:false iframe inside a closed shadow root. frames[n]
+      // can't reach it, so a script keeps the element (as Adcash does).
+      const host = document.createElement("div");
+      const shadow = host.attachShadow({ mode: "closed" });
+      shadow.innerHTML = '<iframe src="javascript:false" style="display:none"></iframe>';
+      document.body.append(host);
+      window.__shadowFrame = shadow.querySelector("iframe");
+      // Nested: javascript:false inside javascript:false.
+      const outer = document.createElement("iframe");
+      outer.name = "jsfouter";
+      outer.src = "javascript:false";
+      outer.style.display = "none";
+      document.body.append(outer);
+      const inner = outer.contentDocument.createElement("iframe");
+      inner.src = "javascript:false";
+      outer.contentDocument.body.append(inner);
+      // Find a child window by name without touching any element.
+      window.__byName = (name) => { for (let i = 0; i < frames.length; i++) { try { if (frames[i].name === name) return frames[i]; } catch {} } };
+    </script>
+    <button id="j-static" onclick="document.getElementById('jsf-static').contentWindow.open('/target.html?case=j-static')">jsf iframe contentWindow.open</button>
+    <button id="j-minipop" onclick="
+      const w = __byName('jsfstatic').open('about:blank', location.origin + '/target.html?case=minipop', 'popup=1,width=5,height=5');
+      if (w) w.document.write('<script>setTimeout(() => location.replace(name), 300)<\/script>');">PopAds minipop</button>
+    <button id="j-frames" onclick="frames.jsfdw.open('/target.html?case=j-frames')">frames[name].open on document.write iframe</button>
+    <button id="j-saved" onclick="__popWin.open('about:blank', 'pop', 'popup=1,width=5,height=5')">PopAds saved contentWindow</button>
+    <button id="j-saved-fn" onclick="__popOpen.call(window, '/target.html?case=j-saved-fn')">open saved from iframe at load, called on main window</button>
+    <button id="j-restore" onclick="window.open = __popWin.open; window.open('/target.html?case=j-restore')">window.open = iframe's open</button>
+    <button id="j-bound" onclick="__boundOpen('/target.html?case=j-bound', '_blank', 'noopener,noreferrer')">Adcash bound open</button>
+    <button id="j-shadow" onclick="__shadowFrame.contentWindow.open('/target.html?case=j-shadow')">shadow-root jsf iframe</button>
+    <button id="j-nested" onclick="__byName('jsfouter')[0].open('/target.html?case=j-nested')">nested jsf iframe</button>
+    <button id="j-detached" onclick="const a = document.createElement('a'); a.href = '/target.html?case=j-detached'; a.target = '_blank'; a.click();">detached link .click()</button>
+    <button id="j-dispatch" onclick="const a = document.createElement('a'); a.href = '/target.html?case=j-dispatch'; a.target = '_blank'; a.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));">detached link dispatchEvent</button>
+    <form id="form-main-blank" action="/target.html" target="_blank"><input type="hidden" name="case" value="j-form-realm"></form>
+    <button id="j-form-realm" onclick="__byName('jsfstatic').HTMLFormElement.prototype.submit.call(document.getElementById('form-main-blank'))">form.submit from iframe realm</button>
+  </section>
+
+  <section>
+    <h2>Gaps found by the v1.2 review</h2>
+    <form id="form-formtarget" action="/target.html"><input type="hidden" name="case" value="formtarget">
+      <button id="btn-formtarget" type="submit" formtarget="_blank">formtarget=_blank</button></form>
+    <!-- Links inside closed shadow roots are invisible to window listeners. -->
+    <div id="shadow-link-host" style="display:inline-block"></div>
+    <div id="shadow-plain-host" style="display:inline-block"></div>
+    <div id="shadow-form-host" style="display:inline-block"></div>
+    <svg id="svg-link" width="120" height="24"><a xlink:href="/target.html?case=svg" target="_blank"><rect width="120" height="24" fill="#ddd"/><text x="4" y="16">SVG xlink</text></a></svg>
+    <script>
+      const closedRoot = document.getElementById("shadow-link-host").attachShadow({ mode: "closed" });
+      closedRoot.innerHTML = '<a href="/target.html?case=shadow-closed" target="_blank">closed-shadow _blank</a>';
+      window.__closedShadowLink = closedRoot.querySelector("a");
+      const plainRoot = document.getElementById("shadow-plain-host").attachShadow({ mode: "closed" });
+      plainRoot.innerHTML = '<a href="/target.html?case=shadow-plain">closed-shadow plain</a>';
+      const openRoot = document.getElementById("shadow-form-host").attachShadow({ mode: "open" });
+      openRoot.innerHTML = '<form action="/target.html" target="_blank"><input type="hidden" name="case" value="shadow-form"><button>shadow form _blank</button></form>' +
+        '<a href="/target.html?case=noncomposed" target="_blank" style="display:none">x</a>';
+      window.__openShadowLink = openRoot.querySelector("a");
+    </script>
+    <button id="j-noncomposed" onclick="__openShadowLink.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: false }))">non-composed click, shadow link</button>
+    <button id="j-closed-click" onclick="__closedShadowLink.click()">closed-shadow link .click()</button>
+    <button id="j-fake-unlisted" onclick="window.dispatchEvent(new CustomEvent('__no_new_tabs_unlisted__', { detail: 'guess' })); window.open('/target.html?case=fake-unlisted')">page fakes "unlisted", then opens</button>
+  </section>
+
+  <section>
+    <h2>Tab-under: open a tab, then move this tab away at once</h2>
+    <script>
+      const otherHost = () => `http://${location.hostname === "localhost" ? "127.0.0.1" : "localhost"}:${location.port}`;
+      const jsfOpen = (c) => __byName("jsfstatic").open(`/target.html?case=${c}`);
+    </script>
+    <button id="t-under-jsf" onclick="jsfOpen('under-jsf'); location.href = otherHost() + '/target.html?case=away'">hidden-frame open, then leave</button>
+    <button id="t-under-main" onclick="open('/target.html?case=under-main'); location.href = otherHost() + '/target.html?case=away'">window.open, then leave</button>
+    <button id="t-back" onclick="jsfOpen('back'); history.back()">hidden-frame open, then history.back()</button>
+    <button id="t-close" onclick="jsfOpen('close'); window.close()">hidden-frame open, then window.close()</button>
+    <button id="t-under-chain" onclick="jsfOpen('under-chain'); location.href = otherHost() + '/chain?n=6'">hidden-frame open, then 6 redirects</button>
+    <script>addEventListener("message", (e) => { if (e.data === "nnt-remove-frame") document.getElementById("xframe").remove(); });</script>
+    <a id="link-cross" href="#">plain link to the other host</a>
+    <script>document.getElementById("link-cross").href = otherHost() + "/index.html";</script>
+  </section>
+
+  <section>
+    <h2>Navigation that must keep working on a listed site</h2>
+    <button id="btn-open-named-iframe" onclick="window.__ret = window.open('/target.html?case=open-in-iframe', 'inner')">window.open into named iframe</button>
+    <button id="btn-open-blank-self" onclick="window.open('about:blank', '_self')">open('about:blank', '_self') (PopAds; blocked)</button>
+    <button id="btn-open-self" onclick="window.open('/target.html?case=open-self', '_self')">window.open(url, '_self')</button>
+    <a id="link-download" href="/data.json" download="data.json" target="_blank">download link (target=_blank)</a>
+    <button id="btn-download-detached" onclick="const a = document.createElement('a'); a.href = window.URL.createObjectURL(new Blob(['x'])); a.download = 'x.txt'; a.target = '_blank'; a.click();">detached download link .click()</button>
+    <p>Same-origin sibling frame, targeting the named iframe below:</p>
+    <iframe id="sib" src="/sib.html"></iframe>
+    <iframe id="sbx" sandbox srcdoc="<p>sandboxed, no scripts</p>"></iframe>
+  </section>
+
+  <section>
+    <p>Named iframe target (must still work, it is not a new tab):</p>
+    <a id="link-to-iframe" href="/target.html?case=in-iframe" target="inner">load into iframe</a>
+    <iframe name="inner" id="inner" src="about:blank"></iframe>
+  </section>
+
+  <section>
+    <!-- An about:blank frame the page reaches into at once: the frame's own
+         guard and the page's both see it. -->
+    <script>window.__earlyBlank = document.body.appendChild(document.createElement("iframe")).contentWindow;</script>
+    <!-- A _blank form that the site submits with requestSubmit() and
+         handles itself. -->
+    <form id="form-ajax" action="/target.html" target="_blank" style="display:inline"
+      onsubmit="event.preventDefault(); window.__ajax = (window.__ajax ?? 0) + 1"><input type="hidden" name="case" value="ajax"></form>
+    <button id="btn-request-submit" onclick="document.getElementById('form-ajax').requestSubmit()">requestSubmit() a _blank form the site handles</button>
+  </section>
+
+  <section>
+    <h2>JavaScript sanity</h2>
+    <button id="btn-count" onclick="this.dataset.n = +(this.dataset.n || 0) + 1; this.textContent = 'clicked ' + this.dataset.n">count</button>
+    <button id="btn-fetch" onclick="fetch('/data.json').then(r => r.json()).then(d => document.getElementById('fetched').textContent = d.ok)">fetch</button>
+    <span id="fetched"></span>
+    <button id="btn-wrap-open" onclick="
+      'use strict';
+      const orig = window.open;
+      window.open = function (...a) { window.__wrapped = true; return orig.apply(this, a); };
+      window.__wrapOk = true;">site wraps window.open (strict mode)</button>
+    <a id="link-same" href="/target.html?case=same-tab">same-tab link</a>
+  </section>
+</body>
+</html>

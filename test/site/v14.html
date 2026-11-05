@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>No New Tabs — v1.3 review cases</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 24px; }
+    section { margin-bottom: 14px; }
+    button, a { margin: 2px 6px 2px 0; }
+    iframe { border: 1px solid #999; width: 300px; height: 40px; }
+  </style>
+</head>
+<body>
+  <h1>Gaps found by the v1.3 review</h1>
+
+  <section>
+    <!-- A frame's open saved while the parser builds the page, through
+         frames[name], before the page ever touches the element. -->
+    <iframe name="pjsf" src="javascript:false" style="display:none"></iframe>
+    <script>window.__parsedOpen = frames.pjsf.open;</script>
+    <button id="j-parsed-saved" onclick="__parsedOpen('/target.html?case=parsed-saved')">open saved from a parsed frame</button>
+
+    <!-- A script-made frame with a src: its open is saved from the initial
+         about:blank window, which the browser reuses for child.html. -->
+    <script>
+      const reuse = document.createElement("iframe");
+      reuse.name = "reuse";
+      reuse.src = "/child.html";
+      reuse.style.display = "none";
+      document.body.append(reuse);
+      window.__reusedOpen = frames.reuse.open;
+    </script>
+    <button id="j-reused-saved" onclick="__reusedOpen('/target.html?case=reused-saved')">open saved before the frame loaded</button>
+  </section>
+
+  <section>
+    <button id="j-ws-self" onclick="window.open('/target.html?case=ws-self', ' _self')">open(url, ' _self')</button>
+    <button id="j-ws-only" onclick="window.open('/target.html?case=ws-only', '   ')">open(url, '   ')</button>
+    <button id="j-ghost" onclick="Object.defineProperty(window, 'name', { get: () => 'ghost', configurable: true }); window.open('/target.html?case=ghost', 'ghost')">fake window.name, then open into it</button>
+    <!-- A sandboxed frame may only navigate itself and its own frames, so
+         naming a sibling opens a new tab. -->
+    <iframe id="sbx-sib" sandbox="allow-scripts allow-same-origin allow-popups"
+      srcdoc="<body style='margin:2px'><button id=b onclick=&quot;window.open('/target.html?case=sbx-sib', 'sibx')&quot;>sandboxed: open into sibling</button></body>"></iframe>
+    <iframe name="sibx" src="about:blank"></iframe>
+  </section>
+
+  <section>
+    <!-- The page changes the target after the guard has looked. -->
+    <a id="late-link" href="/target.html?case=late-link">target set by a click handler</a>
+    <a id="late-base" href="/target.html?case=late-base">base target set by a click handler</a>
+    <form id="late-form" action="/target.html" style="display:inline"><input type="hidden" name="case" value="late-form"><button id="late-form-btn">form target set on submit</button></form>
+    <script>
+      document.addEventListener("click", (e) => {
+        if (e.target.id === "late-link") e.target.target = "_blank";
+        if (e.target.id === "late-base") document.head.insertAdjacentHTML("beforeend", '<base target="_blank">');
+      });
+      document.addEventListener("submit", (e) => { if (e.target.id === "late-form") e.target.target = "_blank"; });
+    </script>
+  </section>
+
+  <section>
+    <!-- Shadow roots the browser builds from HTML. -->
+    <div id="dsf-host" style="display:inline-block"><template shadowrootmode="open"><form action="/target.html" target="_blank"><input type="hidden" name="case" value="decl-form"><button>declarative shadow form _blank</button></form></template></div>
+    <div id="rs-host" style="display:inline-block"><template shadowrootmode="open"><form action="/target.html" target="_blank"><input type="hidden" name="case" value="request-submit"></form></template></div>
+    <button id="j-request-submit" onclick="document.getElementById('rs-host').shadowRoot.querySelector('form').requestSubmit()">requestSubmit() in a shadow root</button>
+    <script>customElements.define("x-closed", class extends HTMLElement { constructor() { super(); this.internals = this.attachInternals(); } });</script>
+    <x-closed id="xc"><template shadowrootmode="closed"><a href="/target.html?case=decl-closed-click" target="_blank">x</a></template></x-closed>
+    <button id="j-decl-closed-click" onclick="document.getElementById('xc').internals.shadowRoot.querySelector('a').click()">.click() in a closed declarative shadow root</button>
+    <div id="dcl-host" style="display:inline-block"><template shadowrootmode="closed"><a href="/target.html?case=decl-closed-plain" style="padding:4px">closed declarative plain link</a></template></div>
+  </section>
+
+  <section>
+    <!-- Frames whose document was written by script, and a data: frame. -->
+    <iframe id="written-early"></iframe>
+    <script>
+      const early = document.getElementById("written-early").contentDocument;
+      early.open();
+      early.write('<body style="margin:2px"><a id="a" href="/target.html?case=written-early" target="_blank">written during load</a></body>');
+      early.close();
+    </script>
+    <iframe id="written-late"></iframe>
+    <script>
+      addEventListener("load", () => {
+        const d = document.getElementById("written-late").contentDocument;
+        d.open();
+        d.write('<body style="margin:2px"><a id="a" href="/target.html?case=written-late" target="_blank">written after load</a></body>');
+        d.close();
+      });
+    </script>
+    <iframe id="data-frame"></iframe>
+    <script>
+      document.getElementById("data-frame").src = "data:text/html," + encodeURIComponent(
+        `<body style="margin:2px"><a id="a" href="${location.origin}/target.html?case=data-frame" target="_blank">data: frame _blank</a></body>`);
+    </script>
+    <button id="j-top-write" onclick="document.open(); document.write('<body style=&quot;font:30px sans-serif;margin:24px&quot;><a id=w href=/target.html?case=top-write target=_blank>rewritten page _blank</a></body>'); document.close();">rewrite this page</button>
+  </section>
+
+  <section>
+    <!-- A listed page turns itself into a blob: copy to shed its site. -->
+    <button id="to-blob" onclick="
+      const html = `<body style='font:30px sans-serif;margin:24px'><button id=bb onclick=&quot;window.__ret = window.open('${location.origin}/target.html?case=blob')&quot;>blob page: window.open</button></body>`;
+      location.href = window.URL.createObjectURL(new Blob([html], { type: 'text/html' }));">go to a blob: copy</button>
+    <button id="j-pip" onclick="window.__pip = 'pending'; documentPictureInPicture.requestWindow({ width: 200, height: 100 }).then(() => window.__pip = 'opened', (e) => window.__pip = e.name)">picture-in-picture window</button>
+  </section>
+
+  <section>
+    <h2>Gaps found by the v1.4 review</h2>
+    <!-- A sandboxed frame turns the top page into a blob: page with an
+         opaque origin (blob:null/...), which has no site of its own. -->
+    <button id="to-blob-null" onclick="
+      const f = document.createElement('iframe');
+      f.sandbox = 'allow-scripts allow-top-navigation allow-popups';
+      const page = `<body style='font:30px sans-serif;margin:24px'><button id=bb onclick=&quot;window.__ret = window.open('${location.origin}/target.html?case=blob-null')&quot;>blob:null page: window.open</button></body>`;
+      f.srcdoc = '<script>top.location.href = URL.createObjectURL(new Blob([' + JSON.stringify(page) + '], { type: \'text/html\' }))<\/script>';
+      document.body.append(f);">go to a blob:null page</button>
+    <!-- Sandboxed without allow-scripts, but same-origin: the page can use
+         the frame's window.open, and a link in it is a link like any other. -->
+    <iframe name="noscript" id="noscript" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+      srcdoc="<body style='margin:2px'><a id=a href='/target.html?case=noscript-link' target=_blank>no-script frame _blank</a></body>"></iframe>
+    <button id="j-noscript-open" onclick="frames.noscript.open('/target.html?case=noscript-open')">no-script frame's window.open</button>
+    <button id="j-noscript-submit" onclick="frames.noscript.HTMLFormElement.prototype.submit.call(document.getElementById('nsform'))">no-script frame's form.submit</button>
+    <form id="nsform" action="/target.html" target="_blank" style="display:none"><input type="hidden" name="case" value="noscript-submit"></form>
+  </section>
+
+  <section>
+    <p id="ctx-text" style="font-size: 20px">Right-click this plain text.</p>
+  </section>
+</body>
+</html>

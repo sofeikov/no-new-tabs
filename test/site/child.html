@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<body style="margin: 4px">
+  <script>
+    // A saved copy of open, then called bare: `this` is undefined.
+    window.__popupOpener = () => {
+      const o = window.open;
+      const w = o("/target.html?case=et-pop", "etpop");
+      const mine = !!w && w.opener === window;
+      w?.close();
+      return mine;
+    };
+    window.__selfOpen = () => { const o = window.open; o("/target.html?case=et-self", "_self"); };
+  </script>
+  child
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "no-new-tabs-tests",
+  "version": "1.0.0",
+  "description": "End-to-end tests for the No New Tabs extension",
+  "main": "index.js",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "private": "true",
+  "devDependencies": {
+    "playwright-core": "^1.64.1"
+  }
+}

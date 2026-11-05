@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<body style="font: 14px system-ui, sans-serif; margin: 24px">
+  <p>The page reads the iframe's contentWindow before the iframe has loaded,
+  so the guard first sees the iframe's initial about:blank window, whose
+  global object the browser then reuses for child.html.</p>
+  <script>
+    const f = document.createElement("iframe");
+    f.id = "child";
+    f.src = "/child.html";
+    document.body.append(f);
+    window.__early = f.contentWindow;
+  </script>
+</body>
+</html>

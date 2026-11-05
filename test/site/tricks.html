@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<body style="font: 14px system-ui, sans-serif; margin: 24px">
+  <iframe name="jsfpre" src="javascript:false" style="display:none"></iframe>
+  <iframe name="jsfacc" src="javascript:false" style="display:none"></iframe>
+  <script>
+    // Before any input, reaching frames through frames[] (so nothing adopts
+    // them): mark one as "already guarded", and make another's native open
+    // the page's window.open.
+    for (let i = 0; i < frames.length; i++) {
+      try {
+        if (frames[i].name === "jsfpre") Object.defineProperty(frames[i], "__noNewTabsGuard", { value: () => false });
+        if (frames[i].name === "jsfacc") window.open = frames[i].open;
+      } catch {}
+    }
+    window.__byName = (name) => { for (let i = 0; i < frames.length; i++) { try { if (frames[i].name === name) return frames[i]; } catch {} } };
+  </script>
+  <button id="j-predefined" onclick="__byName('jsfpre').open('/target.html?case=predefined')">frame pre-marked as guarded</button>
+  <button id="j-accessor" onclick="window.open('/target.html?case=accessor')">window.open = a frame's native open, set at load</button>
+</body>
+</html>

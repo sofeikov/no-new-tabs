@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head>
+  <script>
+    // Before arm.js has answered: a fake "unlisted" (the guard must stay),
+    // then keep window.open for later.
+    window.dispatchEvent(new CustomEvent("__no_new_tabs_unlisted__", { detail: "guess" }));
+    window.__early = window.open;
+  </script>
+</head>
+<body style="font: 14px system-ui, sans-serif; margin: 24px">
+  <button id="j-fake-early" onclick="__early('/target.html?case=fake-early')">page faked "unlisted" during load</button>
+  <button id="j-fake-arm" onclick="dispatchEvent(new CustomEvent('__no_new_tabs_arm__', { detail: 'guess' })); window.open('/target.html?case=fake-arm')">page fakes "arm", then opens</button>
+</body>
+</html>
