@@ -836,6 +836,19 @@ async function docOpenMenus() {
   await raw.setDomains(["localhost"]);
 }
 
+// Issue 5: a script dispatching click with button 1 (or a modifier) on a
+// same-tab link opens a background tab. The guard must cancel it, so no
+// tab even flashes: assert created === 0, not just survived === 0.
+async function syntheticClicks() {
+  console.log("\n=== Synthetic clicks on same-tab links (issue 5) ===");
+  await rawLoad(`${LISTED}/index.html`);
+  for (const [name, sel] of [["synthetic button=1 click", "#j-syn-mid"], ["synthetic ctrl+click", "#j-syn-ctrl"],
+      ["synthetic shift+click", "#j-syn-shift"], ["synthetic meta+click", "#j-syn-meta"]]) {
+    const r = await rawCase(() => rp.click(sel));
+    report(name, !r.error && r.created === 0, `(created ${r.created}, left ${r.survived ?? "?"})`);
+  }
+}
+
 // Adding a site arms an open page, hidden frames included, even before any
 // input (needs the popup blocker off for the frame to open anything).
 async function liveArmNoInput() {
@@ -881,6 +894,7 @@ try {
   await contextMenu();
   await fakeMenuRecord();
   await docOpenMenus();
+  await syntheticClicks();
   await launchRawBrowser(EXT, ["--disable-popup-blocking"]);
   await liveArmNoInput();
 
