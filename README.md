@@ -77,8 +77,10 @@ There are two layers.
      source is judged by its opener, including restored pages.
    - What you pick from the right-click menu on a listed page opens
      normally: **Search for the selected text** (also when the selection
-     includes a link, or is inside a text box), **Open image in new tab**
-     (also on a linked image) and **Open video in new tab**. The extension
+     includes a link, or is inside a text box), **Go to <address>**
+     (Brave's item, shown when the selection looks like an address),
+     **Open image in new tab** (also on a linked image) and **Open video
+     in new tab**. The extension
      notes what the menu offers when you right-click — the selection as it
      stood before the button went down (at least 3 characters), and loaded
      images that are not thumbnails linking to themselves — and keeps a tab
@@ -210,6 +212,15 @@ set `PORT=` if that is taken.
 ```bash
 # from test/
 CHROME=/usr/bin/chromium PORT=9000 node run.mjs
+```
+
+Matching logic that a headless browser cannot drive (Brave's native
+"Go to <address>" item) is covered by unit vectors through the shipped
+code instead ([unit.mjs](test/unit.mjs)):
+
+```bash
+# from test/
+node --test unit.mjs
 ```
 
 The suite lists `localhost`, uses `127.0.0.1` as the unlisted control, and
@@ -833,11 +844,14 @@ context menu.
 listed ([background.js:307-310](extension/background.js#L307-L310)). It needs
 `born.get(tabId).url`, which exists only for browser-made tabs. It needs a
 menu record for the source tab less than 300 s old. `offeredByMenu` then
-accepts the URL if it equals one of the reported `srcs`, or if the
-selection, whitespace-collapsed, lowercased and cut to 50 characters (and
-not empty), appears in a decoded query-parameter value of the URL. On a
-match the record is deleted: one tab per menu
-([background.js:264-288](extension/background.js#L264-L288)).
+accepts the URL if it equals one of the reported `srcs`, if it is the
+selected address itself (Brave's "Go to <address>": the selection parsed
+as a URL, with `http://` added to bare hosts, compared against the tab's
+host and path exactly — not as a substring — and case-insensitively), or
+if the selection, whitespace-collapsed, lowercased and cut to 50
+characters (and not empty), appears in a decoded query-parameter value of
+the URL. On a match the record is deleted: one tab per menu
+([background.js:391-441](extension/background.js#L391-L441)).
 
 **Why not the obvious way.** A page-made tab has no address at creation, so
 a page can never use the exemption by calling `window.open`. An empty
@@ -2225,8 +2239,6 @@ them.
     the PDF viewer's frames like normal frames, so the PDF rule
     ([background.js:289-297](extension/background.js#L289-L297)) never
     fires.
-  - Brave's "Go to &lt;address&gt;" item, shown when the selection looks
-    like an address.
   - "Open image in new tab" on images inside a closed shadow root or an SVG
     `<image>`. `arm.js` does not report those sources.
 - **Test coverage.** No test checks that a context-menu tab the user chose
