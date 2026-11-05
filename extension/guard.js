@@ -626,7 +626,10 @@
       const path = composedPath(e);
       const type = evType(e);
       const modifier = ctrlKey(e) || metaKey(e) || shiftKey(e);
-      const middle = type === "auxclick" && button(e) === 1;
+      // A script can dispatch a "click" with button 1, which the browser
+      // treats as a middle click. later() reuses opens() below, so this
+      // covers the re-check too.
+      const middle = button(e) === 1 && (type === "auxclick" || type === "click");
 
       const link = find(path, isLink);
       if (link) {

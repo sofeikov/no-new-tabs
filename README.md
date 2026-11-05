@@ -1729,13 +1729,14 @@ window) and middle-click all open new contexts. Downloads must still work.
 
 **What it does.** `onActivate` is a capture listener on the window for
 `click` and `auxclick`, so it runs before page handlers
-([guard.js:613-632](extension/guard.js#L613-L632)). It returns early if the
+([guard.js:623-657](extension/guard.js#L623-L657)). It returns early if the
 event is already `defaultPrevented` (handled further out, which avoids
 double handling between window and shadow-root listeners). It takes the
 first link in the saved `composedPath`, so the innermost link wins. A link
 with `download` is left alone unless it is a middle or modifier click. It
-blocks a middle `auxclick`, a click with Ctrl, Meta or Shift, or a click
-whose target opens a new context.
+blocks a middle `auxclick`, a click with Ctrl, Meta or Shift, a `click`
+with button 1 (a script dispatching one is treated as a middle click), or
+a click whose target opens a new context.
 
 **Why not the obvious way.** `composedPath` sees through open shadow roots,
 where `e.target` is retargeted to the host. A `_blank` download starts a
