@@ -329,7 +329,9 @@
   // script of their own, but with allow-same-origin the page can call
   // their window.open.
   function adopt(win) {
-    if (!win) return;
+    // Removed (page is unlisted): install() already refuses, and the walk
+    // below would still cost a subtree scan on every adopted read.
+    if (!win || state.removed) return;
     try {
       install(win);
       sweep(win);
@@ -570,12 +572,14 @@
             return null;
           }
         }
-        try { return apply(native, this, args); } finally { relisten(this); sweepFrom(this); }
+        // relisten() stays even when removed: a rewrite drops the control
+        // listeners, and a later arm signal must still be heard.
+        try { return apply(native, this, args); } finally { relisten(this); if (!state.removed) sweepFrom(this); }
       },
     }.open));
     each(["write", "writeln"], (key) => method(win.Document.prototype, key, (native) => ({
       [key]() {
-        try { return apply(native, this, arguments); } finally { relisten(this); sweepFrom(this); }
+        try { return apply(native, this, arguments); } finally { relisten(this); if (!state.removed) sweepFrom(this); }
       },
     }[key])));
 
@@ -696,7 +700,27 @@
     // Any insertion that adds a frame to a window: adopt the new frames
     // before the call returns.
     const FRAME_SELECTOR = "iframe, frame, object, embed";
-    const hasFrame = (n) => isElement(n) && (matches(n, FRAME_SELECTOR) || !!elQuery(n, FRAME_SELECTOR));
+    const childWindow = (el) => {
+      try { return iframeWindow(el); } catch { try { return el.contentWindow; } catch { return null; } }
+    };
+    // Adopt only what this call could have added: the inserted nodes
+    // themselves, wherever they landed. String HTML (innerHTML and
+    // friends) can land anywhere, so only a sweep is sure to find those
+    // frames.
+    const adoptAdded = (view, before, after, args) => {
+      if (!view) return;
+      let nodes = false;
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (!isElement(a)) continue;
+        nodes = true;
+        try { if (matches(a, FRAME_SELECTOR)) adopt(childWindow(a)); } catch {}
+        let nl = null;
+        try { nl = elQuery(a, FRAME_SELECTOR); } catch {}
+        if (nl) eachNode(nl, (el) => { try { adopt(childWindow(el)); } catch {} });
+      }
+      if (!nodes && after > before) sweep(view);
+    };
     // A page can shadow startContainer on Node.prototype, so only trust
     // each realm's own Range getter, and only on a real Range of that realm.
     let rangeStart = null;
@@ -710,6 +734,11 @@
     };
     const framesAfter = (native, key) => ({
       [key]() {
+        // Unlisted and removed: a plain call-through, so wrappers a page
+        // script saved earlier cost nothing and run no extension code. (A
+        // page that is merely not yet armed keeps adoption below: it could
+        // otherwise save a frame's native window.open before arming.)
+        if (state.removed) return apply(native, this, arguments);
         const view = viewOfTarget(this);
         let before = -1;
         try { before = view ? winLength(view) : -1; } catch {}
@@ -718,11 +747,7 @@
         } finally {
           let after = before;
           try { after = view ? winLength(view) : -1; } catch {}
-          let swapped = false; // same count, but a frame swapped for another one?
-          if (after === before && after > 0) {
-            for (let i = 0; i < arguments.length && !swapped; i++) swapped = hasFrame(arguments[i]);
-          }
-          if (after !== before || swapped) sweep(view);
+          adoptAdded(view, before, after, arguments);
           // Tame script-inserted iframes at once; parser-inserted ones are
           // caught by the observer below, which sees the same count change.
           if (state.armed) for (let i = 0; i < arguments.length; i++) {
