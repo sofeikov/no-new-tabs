@@ -767,6 +767,73 @@ async function reloadEdge() {
   report("popup after a top commit is judged normally", !after.error && after.survived === 1, `(created ${after.created})`);
 }
 
+// Issue 15: a tab the user chose from a menu must be kept. The record is
+// seeded the way arm.js writes it (recording is covered by the
+// full-extension menu tests); each seed is followed by a worker stop, so
+// the cold restore loads it into memory exactly as a restart would.
+async function menuKept() {
+  console.log("\n=== Menu-chosen tabs are kept (issue 15) ===");
+  const seedMenu = (menu) => raw.swEval(`chrome.tabs.query({}).then((tabs) => {
+    const id = tabs.find((t) => /index\\.html$/.test(t.url))?.id;
+    return chrome.storage.session.set({ menus: { [id]: ${JSON.stringify(menu)} } });
+  })`);
+  const clearMenus = () => raw.swEval(`chrome.storage.session.remove("menus")`);
+  // clickIn falls back to the frame's top left for cross-origin frames, so
+  // resolve the link's point inside the frame itself.
+  const ctrlClick = async (sel) => {
+    await rp.eval(`document.querySelector("#xframe").scrollIntoView({ block: "center" })`);
+    const [fx, fy] = await rp.frameEval("xframe", `(() => {
+      const el = document.querySelector(${JSON.stringify(sel)});
+      el.scrollIntoView({ block: "center" });
+      // The link can wrap: the middle of the whole box may be blank.
+      const r = el.getClientRects()[0];
+      return [r.x + r.width / 2, r.y + r.height / 2];
+    })()`, false);
+    const [x, y] = await rp.eval(`(() => {
+      const f = document.querySelector("#xframe");
+      const fr = f.getBoundingClientRect();
+      return [fr.x + f.clientLeft + (${fx}), fr.y + f.clientTop + (${fy})];
+    })()`);
+    await rp.clickAt(x, y, { modifiers: ["Control"] });
+  };
+  const words = "zqxj menu words";
+  await rawLoad(`${LISTED}/index.html`);
+  await sleep(300); // let the load's own save land: later saves merge, never wipe the seed
+  const imgUrl = `${UNLISTED}/px.png?realimg`; // resolved against the cross-origin frame
+  // A search tab: the query carries the selected words.
+  await seedMenu({ selection: words, srcs: [], t: Date.now() });
+  await raw.stopSW();
+  const search = await rawCase(() => ctrlClick("#frame-menusearch"));
+  report("menu search tab is kept", !search.error && search.survived === 1, `(created ${search.created})`);
+  // An image tab: its address is one the menu offered.
+  await seedMenu({ selection: "", srcs: [imgUrl], t: Date.now() });
+  await raw.stopSW();
+  const img = await rawCase(() => ctrlClick("#frame-menuimg"));
+  report("menu image tab is kept", !img.error && img.survived === 1, `(created ${img.created})`);
+  // An unrelated tab from the same menu is still closed.
+  await seedMenu({ selection: words, srcs: [imgUrl], t: Date.now() });
+  await raw.stopSW();
+  const other = await rawCase(() => ctrlClick("#frame-menuunrelated"));
+  report("unrelated tab after a menu is closed", !other.error && other.survived === 0, `(created ${other.created})`);
+  // One tab per menu: the record is gone after the first keep.
+  await seedMenu({ selection: words, srcs: [], t: Date.now() });
+  await raw.stopSW();
+  const first = await rawCase(() => ctrlClick("#frame-menusearch"));
+  const second = await rawCase(() => ctrlClick("#frame-menusearch"));
+  report("second tab from one menu is closed", !first.error && first.survived === 1 && !second.error && second.survived === 0,
+    `(first ${first.created}/${first.survived}, second ${second.created}/${second.survived})`);
+  // With no record at all, the same click is closed.
+  await clearMenus();
+  await raw.stopSW();
+  const none = await rawCase(() => ctrlClick("#frame-menusearch"));
+  report("menu-link tab with no menu is closed", !none.error && none.survived === 0, `(created ${none.created})`);
+  // A menu older than five minutes no longer approves anything.
+  await seedMenu({ selection: words, srcs: [], t: Date.now() - 301_000 });
+  await raw.stopSW();
+  const old = await rawCase(() => ctrlClick("#frame-menusearch"));
+  report("301-second-old menu is closed", !old.error && old.survived === 0, `(created ${old.created})`);
+}
+
 // What the user picks from a context menu opens a tab of their own, but a
 // context menu must not open the door for the page: a link click that gets
 // past the in-page guard right after one is still closed.
@@ -864,6 +931,24 @@ async function fakeMenuRecord() {
   await sleep(400);
   const srcsInput = (await record())?.srcs ?? null;
   report("input image is reported", Array.isArray(srcsInput) && srcsInput.some((u) => u.includes("px.png?input")));
+}
+
+// Issue 15: the record must be genuine — a synthetic contextmenu records
+// nothing, and a synthetic mousedown in another frame does not end a real
+// menu. Runs with the full extension, where arm.js does the recording.
+async function menuRecordAuthenticity() {
+  console.log("\n=== Menu record authenticity (issue 15) ===");
+  const record = () => raw.swEval(`chrome.storage.session.get("menus").then((s) => Object.values(s.menus ?? {})[0] ?? null)`);
+  await rawLoad(`${LISTED}/index.html`);
+  await rp.eval(`document.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, button: 2 }))`);
+  await sleep(400);
+  report("synthetic contextmenu is not recorded", (await record()) === null);
+  await rp.click("#menu-realimg", { button: "right" });
+  await sleep(400);
+  const before = await record();
+  await rp.frameEval("xframe", `document.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }))`, false);
+  await sleep(400);
+  report("synthetic mousedown does not end the menu", !!before && !!(await record()));
 }
 
 // Issue 4: document.open() drops every listener on the window and document,
@@ -1223,6 +1308,7 @@ try {
   await workerRestart();
   await contextMenu();
   await fakeMenuRecord();
+  await menuRecordAuthenticity();
   await docOpenMenus();
   await syntheticClicks();
   await launchRawBrowser(EXT, ["--disable-popup-blocking"]);
@@ -1242,6 +1328,7 @@ try {
   await noSourceTabs();
   await storageWrites();
   await reloadEdge();
+  await menuKept();
 
   await launchRawBrowser(bgOnly, ["--disable-popup-blocking"]);
   await popupChain();

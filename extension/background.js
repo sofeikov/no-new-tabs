@@ -254,6 +254,10 @@ chrome.webNavigation.onCommitted.addListener((d) => {
   if (d.frameId === 0) {
     // History from here on is observed, so the unknown window is over.
     unknownTabs.delete(d.tabId);
+    // A tab born without an address (ctrl-click) learns it at commit, in
+    // time for the no-navigation-source fallback below.
+    const birth = born.get(d.tabId);
+    if (birth && !birth.url) birth.url = d.url;
     if (!firstCommit.has(d.tabId)) {
       firstCommit.set(d.tabId, { transitionType: d.transitionType });
       setTimeout(() => firstCommit.delete(d.tabId), 10_000);
@@ -560,8 +564,11 @@ function offeredByMenu(menu, url) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MENU_WINDOW_MS = 30_000;
 
-async function fromUserMenu(tabId, sourceTabId, sourceFrameId, domains) {
-  const url = born.get(tabId)?.url;
+async function fromUserMenu(tabId, sourceTabId, sourceFrameId, domains, navUrl) {
+  // A ctrl-clicked tab carries no address at creation; the navigation
+  // event that follows names it. Either one is the browser's own record,
+  // never the page's word.
+  const url = born.get(tabId)?.url || navUrl;
   if (!url) return false;
   const menu = menus.get(sourceTabId);
   if (menu && Date.now() - menu.t < MENU_WINDOW_MS && offeredByMenu(menu, url)) {
@@ -591,7 +598,7 @@ function decideFromNav(details, atSeq) {
     const { sourceTabId, sourceFrameId, timeStamp } = details;
     const listed = await wasListed(sourceTabId, sourceFrameId, [{ atSeq }, { atTime: timeStamp }], domains);
     if (!listed) return false;
-    if (await fromUserMenu(details.tabId, sourceTabId, sourceFrameId, domains)) {
+    if (await fromUserMenu(details.tabId, sourceTabId, sourceFrameId, domains, details.url)) {
       console.info("[no-new-tabs] kept tab", details.tabId, "chosen from a context menu:", details.url);
       return false;
     }

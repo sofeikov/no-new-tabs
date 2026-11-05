@@ -10,6 +10,9 @@
   <iframe name="jsf" src="javascript:false" style="display:none"></iframe>
   <button id="frame-jsf" onclick="frames.jsf.open('/target.html?case=xframe-jsf')">iframe: jsf open</button>
   <a id="frame-blank" href="/target.html?case=xframe-blank" target="_blank">iframe: target=_blank</a>
+  <a id="frame-menusearch" href="/target.html?case=menu-search&q=zqxj+menu+words">iframe: menu search stand-in</a>
+  <a id="frame-menuimg" href="/px.png?realimg">iframe: menu image stand-in</a>
+  <a id="frame-menuunrelated" href="/target.html?case=menu-unrelated">iframe: unrelated to any menu</a>
   <script>const otherHost = () => `http://${location.hostname === "localhost" ? "127.0.0.1" : "localhost"}:${location.port}`;</script>
   <!-- Open, then at once leave or have the page remove this frame. -->
   <button id="frame-open-leave" onclick="window.open('/target.html?case=xframe-leave'); location.replace(otherHost() + '/target.html?case=frame-away')">iframe: open, then leave</button>
