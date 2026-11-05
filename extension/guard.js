@@ -74,6 +74,19 @@
   const matches = uncurry(Element.prototype.matches);
   const elQuery = uncurry(Element.prototype.querySelector);
   const docQuery = uncurry(Document.prototype.querySelector);
+  const docQueryAll = uncurry(Document.prototype.querySelectorAll);
+  const setAttr = uncurry(Element.prototype.setAttribute);
+  // Own indexed element of a NodeList: poisoned Array/NodeList prototype
+  // members must not affect the walk.
+  const eachNode = (nl, fn) => {
+    if (!nl) return;
+    for (let i = 0; ; i++) {
+      let n;
+      try { n = ownDesc(nl, i)?.value; } catch { return; }
+      if (n === undefined) return;
+      fn(n);
+    }
+  };
   const defaultView = getter(Document.prototype, "defaultView");
   const evType = getter(Event.prototype, "type");
   const evTarget = getter(Event.prototype, "target");
@@ -159,6 +172,7 @@
     install(window); // in case it was removed as unlisted
     forEachRecord((rec) => rec.lock());
     sweep(window);
+    tameDocument(document);
   }
 
   // --- Where does a target name lead? ---------------------------------------
@@ -292,6 +306,58 @@
       adopt(child);
     }
   }
+
+  // A frame the parent can never adopt (opaque origin: no allow-scripts and
+  // no allow-same-origin) with allow-popups opens a tab the guard can't
+  // stop. On listed pages, take allow-popups away before it navigates: the
+  // click then does nothing instead of flashing. Left alone when the frame
+  // can run scripts (its own guard copy covers it) or is same-origin (the
+  // parent's adoption covers it).
+  const hasSandboxToken = (value, token) => {
+    const s = `${value ?? ""}`;
+    let cur = "";
+    for (let i = 0; i <= s.length; i++) {
+      const c = i < s.length ? charAt(s, i) : 32;
+      if (c === 32 || c === 9 || c === 10 || c === 12 || c === 13) {
+        if (toLower(cur) === token) return true;
+        cur = "";
+      } else cur += s[i];
+    }
+    return false;
+  };
+  const stripPopups = (value) => {
+    const s = `${value ?? ""}`;
+    if (!hasSandboxToken(s, "allow-popups")) return s;
+    if (hasSandboxToken(s, "allow-scripts") || hasSandboxToken(s, "allow-same-origin")) return s;
+    let out = "", cur = "";
+    const flush = () => {
+      if (cur !== "" && toLower(cur) !== "allow-popups") out += (out === "" ? "" : " ") + cur;
+      cur = "";
+    };
+    for (let i = 0; i <= s.length; i++) {
+      const c = i < s.length ? charAt(s, i) : 32;
+      if (c === 32 || c === 9 || c === 10 || c === 12 || c === 13) flush();
+      else cur += s[i];
+    }
+    flush();
+    return out;
+  };
+  const tameSandbox = (el) => {
+    try {
+      const v = getAttr(el, "sandbox");
+      if (v == null) return;
+      const stripped = stripPopups(v);
+      if (stripped !== v) apply(setAttr, el, ["sandbox", stripped]);
+    } catch {}
+  };
+  const tameDocument = (doc) => {
+    if (!state.armed || !doc) return;
+    try {
+      let nl = null;
+      try { nl = docQueryAll(doc, "iframe[sandbox]"); } catch { return; }
+      eachNode(nl, tameSandbox);
+    } catch {}
+  };
 
   // --- Install into one window (this one, or an adopted child) --------------
 
@@ -562,6 +628,27 @@
       });
     });
 
+    // Post-insertion sandbox escalation: strip allow-popups the same way
+    // no matter how it is set, and tame the IDL setter too (it reflects to
+    // the attribute without going through setAttribute).
+    method(win.Element.prototype, "setAttribute", (native) => ({
+      setAttribute() {
+        if (state.armed && arguments.length >= 2 && isElement(this)) {
+          let k = "";
+          try { k = toLower(`${arguments[0]}`); } catch {}
+          if (k === "sandbox" && localName(this) === "iframe") {
+            try { arguments[1] = stripPopups(`${arguments[1] ?? ""}`); } catch {}
+          }
+        }
+        return apply(native, this, arguments);
+      },
+    }.setAttribute));
+    setter(win.HTMLIFrameElement?.prototype, "sandbox", (native) => function (v) {
+      let value = v;
+      try { if (state.armed) value = stripPopups(value); } catch {}
+      return apply(native, this, [value]);
+    });
+
     // Any insertion that adds a frame to a window: adopt the new frames
     // before the call returns.
     const FRAME_SELECTOR = "iframe, frame, object, embed";
@@ -592,6 +679,12 @@
             for (let i = 0; i < arguments.length && !swapped; i++) swapped = hasFrame(arguments[i]);
           }
           if (after !== before || swapped) sweep(view);
+          // Tame script-inserted iframes at once; parser-inserted ones are
+          // caught by the observer below, which sees the same count change.
+          if (state.armed) for (let i = 0; i < arguments.length; i++) {
+            const a = arguments[i];
+            if (isElement(a) && matches(a, "iframe")) tameSandbox(a);
+          }
         }
       },
     })[key];
@@ -618,6 +711,7 @@
       if (n !== known) {
         known = n;
         sweep(win);
+        tameDocument(win.document);
       }
     });
     observer.observe(win.document, nullProto({ childList: true, subtree: true }));
@@ -626,6 +720,7 @@
       try {
         const el = evTarget(e);
         if (!isElement(el) || !matches(el, FRAME_SELECTOR)) return;
+        if (matches(el, "iframe")) tameSandbox(el);
         let child = null;
         try { child = iframeWindow(el); } catch { child = el.contentWindow; } // <frame>, <object>
         adopt(child);
