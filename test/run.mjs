@@ -849,6 +849,84 @@ async function syntheticClicks() {
   }
 }
 
+// Issue 8: a hostile listed page poisoning prototypes or exhausting the
+// stack must not keep a tab open. The prototype attacks assert created === 0
+// (a flash-then-close still counts as a failure); stack exhaustion has no
+// complete in-page fix, so that one asserts the background closes the tab.
+// Needs the popup blocker off: the attacks use untrusted opens.
+async function hardening() {
+  console.log("\n=== Guard hardening (issue 8) ===");
+  // 1. An accessor on Array.prototype[1]: the guard must read the real
+  // target name, and pass that same copy to the native call.
+  await rawLoad(`${LISTED}/index.html`);
+  let r = await rawCase(() => rp.eval(`(() => {
+    Object.defineProperty(Array.prototype, "1",
+      { configurable: true, get() { return "_self"; }, set(v) {} });
+    window.open("/target.html?case=h-array", "adwin");
+  })()`));
+  report("poisoned Array.prototype[1] window.open", !r.error && r.created === 0, `(created ${r.created})`);
+  // 2. An aborted signal on Object.prototype: the late re-check after page
+  // handlers must still be added.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      const c = new AbortController(); c.abort();
+      Object.defineProperty(Object.prototype, "signal", { configurable: true, value: c.signal });
+      const a = document.createElement("a");
+      a.id = "h-late"; a.href = "/target.html?case=h-signal"; a.textContent = "x";
+      document.body.append(a);
+      a.addEventListener("click", function () { this.target = "_blank"; });
+    })()`);
+    await rp.click("#h-late");
+  });
+  report("poisoned Object.prototype.signal late check", !r.error && r.created === 0, `(created ${r.created})`);
+  // 3. Stack exhaustion: the page recurses until RangeError, then dispatches
+  // a click from each level while unwinding. The first dispatch the browser
+  // can run still has no stack for the guard's listener to run in (a probe
+  // listener registered after the guard's never fires either), so no
+  // in-page fix can cancel every such event: the tab may flash. The guard
+  // fails closed whenever its listener runs at all; the guarantee is the
+  // background, which closes the tab: assert survived === 0, not no-flash.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(() => rp.eval(`(() => {
+    const a = document.createElement("a");
+    a.href = "/target.html?case=h-stack"; a.target = "_blank"; a.textContent = "x";
+    document.body.append(a);
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    (function deep() {
+      try { deep(); }
+      catch (e) { a.dispatchEvent(ev); }
+    })();
+  })()`));
+  report("stack exhaustion dispatch", !r.error && r.survived === 0, `(created ${r.created}, left ${r.survived})`);
+  // 4. A getter on Node.prototype.startContainer: inserting a frame the
+  // browser never injects scripts into (javascript: URL) must still be
+  // judged in the right window, so the frame is adopted at once.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(() => rp.eval(`(() => {
+    const d = document.implementation.createHTMLDocument();
+    Object.defineProperty(Node.prototype, "startContainer",
+      { configurable: true, get() { return d; } });
+    document.body.insertAdjacentHTML("beforeend", '<iframe src="javascript:false"></iframe>');
+    window.__ret = window[window.length - 1].open("/target.html?case=h-start", "scframe");
+  })()`));
+  report("poisoned Node.prototype.startContainer frame insert", !r.error && r.created === 0,
+    `(created ${r.created}, returned ${r.ret})`);
+  // 5. A replaced window.Function: after document.open() drops the
+  // listeners, they must still be put back.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      window.Function = function Fake() {};
+      document.open();
+      document.write('<a id="h-fn" href="/target.html?case=h-fn" target="_blank">x</a>');
+      document.close();
+    })()`);
+    await rp.click("#h-fn");
+  });
+  report("replaced window.Function document.open()", !r.error && r.created === 0, `(created ${r.created})`);
+}
+
 // Adding a site arms an open page, hidden frames included, even before any
 // input (needs the popup blocker off for the frame to open anything).
 async function liveArmNoInput() {
@@ -897,6 +975,7 @@ try {
   await syntheticClicks();
   await launchRawBrowser(EXT, ["--disable-popup-blocking"]);
   await liveArmNoInput();
+  await hardening();
 
   console.log("\n##### Background layer only (no content scripts) #####");
   const bgOnly = backgroundOnlyCopy();
