@@ -62,7 +62,10 @@ There are two layers.
      Every change of site in every frame is recorded with the browser's own
      timestamps and kept in session storage. This still works when Chrome
      has stopped the extension's worker, which it does after 30 seconds of
-     quiet. Only host names are kept, not addresses.
+     quiet. Only host names are kept, not addresses. Each tab's rows are
+     stored under their own key and written at most once per 150 ms (at
+     once when a tab is blocked or a menu is recorded), so
+     rapid frame commits don't rewrite the whole record on every commit.
    - A page can't shed its site by turning itself into a `blob:` copy (also
      one made in a sandboxed frame, `blob:null/…`) or an `about:blank`.
      Those count as the site that made them.
@@ -2195,6 +2198,10 @@ handled. Items marked "from reading the code" are not covered by tests.
   closed, like any other way the site's links open a tab. That includes a
   link inside a closed shadow root. A tab chosen from the menu more than 5
   minutes after the right-click is closed too.
+- **Right-click, Open image in new tab** on an image with a `data:`
+  address is closed: the menu record skips `data:` addresses (a photo
+  inlined as base64 would blow the session-storage quota on its own), so
+  the tab is judged by its opener instead of matched to the menu.
 - **On a listed site, `window.open` can't be redefined with
   `Object.defineProperty` once the page is guarded** (plain assignment
   works). A script that tries gets an error.

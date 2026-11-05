@@ -54,20 +54,32 @@ const restoredTabs = new Set(); // tabId
 const pack = (entries) => entries.map(({ f, p, h, t, left }) => [f, p, h, t, left ?? 0]);
 const unpack = (rows) => rows.map(([f, p, h, t, left]) => ({ f, p, h, t, seq: 0, ...(left ? { left } : {}) }));
 
-const restored = chrome.storage.session.get(["spawned", "history", "trimmed", "menus", "gone", "restoredTabs"])
+const restored = chrome.storage.session.get(null)
   .then((saved) => {
+    saved ??= {};
     (saved.spawned ?? []).forEach((id) => spawned.add(id));
     (saved.trimmed ?? []).forEach((id) => trimmed.add(id));
     (saved.restoredTabs ?? []).forEach((id) => restoredTabs.add(id));
     for (const [id, m] of Object.entries(saved.menus ?? {})) if (!menus.has(+id)) menus.set(+id, m);
     for (const [id, at] of Object.entries(saved.gone ?? {})) if (!gone.has(+id)) gone.set(+id, at);
     // Saved entries predate everything this worker has seen (seq 0).
-    for (const [id, rows] of Object.entries(saved.history ?? {})) {
-      history.set(+id, [...unpack(rows), ...(history.get(+id) ?? [])]);
+    // Per-tab keys from this format, plus the old single key once when an
+    // older version wrote it.
+    for (const [key, value] of Object.entries(saved)) {
+      const m = /^h\.(\d+)$/.exec(key);
+      if (m) history.set(+m[1], [...unpack(value?.rows ?? []), ...(history.get(+m[1]) ?? [])]);
+    }
+    if (saved.history && typeof saved.history === "object") {
+      dropLegacyHistory = true;
+      for (const [id, rows] of Object.entries(saved.history)) {
+        history.set(+id, [...unpack(rows), ...(history.get(+id) ?? [])]);
+        touchTab(+id);
+      }
     }
   })
   .catch(() => {})
   .then(async () => {
+    let changed = dropLegacyHistory;
     // Tabs open before the extension started have no saved history: start
     // it with what they show now.
     for (const tab of await chrome.tabs.query({}).catch(() => [])) {
@@ -75,44 +87,124 @@ const restored = chrome.storage.session.get(["spawned", "history", "trimmed", "m
       if (!entries.some((e) => e.f === 0 && e.seq === 0)) {
         entries.unshift({ f: 0, p: -1, h: siteOf(tab.url || tab.pendingUrl || "") ?? "", t: 0, seq: 0 });
         history.set(tab.id, entries);
+        touchTab(tab.id);
+        changed = true;
       }
     }
-    forgetGone();
+    if (forgetGone().length) changed = true;
+    if (changed) persist();
   });
+
+// Writes used to rewrite the whole history under one key on every frame
+// commit. Now each tab's rows live under their own key and only changed
+// tabs (plus the small global sets, when they change) are written, at most
+// once per PERSIST_DEBOUNCE_MS. A block or a menu record saves at once:
+// those must survive a worker stop that could come at any moment.
+const PERSIST_DEBOUNCE_MS = 150;
+const hkey = (id) => `h.${id}`;
+const dirtyTabs = new Set(); // tab ids whose rows still need saving
+let globalsDirty = true; // spawned/trimmed/menus/gone/restoredTabs need saving
+let dropLegacyHistory = false; // old single-key format seen at restore
+const touchTab = (id) => { dirtyTabs.add(id); };
+const touchGlobals = () => { globalsDirty = true; };
 
 let persistTimer = null;
 let writes = 0;
-function persist() {
-  persistTimer ??= setTimeout(() => restored.then(() => {
-    const write = ++writes;
+let saving = false;
+function persist(now = false) {
+  if (now) {
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+    void save();
+    return;
+  }
+  persistTimer ??= setTimeout(() => {
     persistTimer = null;
-    forgetGone();
-    const saved = {};
-    for (const [id, entries] of history) saved[id] = pack(entries);
-    chrome.storage.session.set({
-      spawned: [...spawned].slice(-500),
-      history: saved,
-      trimmed: [...trimmed],
-      restoredTabs: [...restoredTabs].slice(-500),
-      menus: Object.fromEntries(menus),
-      gone: Object.fromEntries(gone),
-    }).catch((e) => {
+    void save();
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+async function save() {
+  // One pass at a time; dirt that arrives mid-save folds into the next.
+  if (saving) { persist(); return; }
+  saving = true;
+  try {
+    await restored;
+    await pruneDead();
+    const forgotten = forgetGone();
+    for (const id of forgotten) dirtyTabs.delete(id);
+    const removals = [...forgotten.map(hkey), ...(dropLegacyHistory ? ["history"] : [])];
+    const patch = {};
+    if (globalsDirty) {
+      patch.spawned = [...spawned].slice(-500);
+      patch.trimmed = [...trimmed];
+      patch.restoredTabs = [...restoredTabs].slice(-500);
+      patch.menus = Object.fromEntries(menus);
+      patch.gone = Object.fromEntries(gone);
+    }
+    for (const id of dirtyTabs) {
+      const rows = history.get(id);
+      if (rows) patch[hkey(id)] = { rows: pack(rows) };
+      else removals.push(hkey(id));
+    }
+    dirtyTabs.clear();
+    globalsDirty = false;
+    dropLegacyHistory = false;
+    if (!Object.keys(patch).length && !removals.length) return;
+    const write = ++writes;
+    if (removals.length) await chrome.storage.session.remove(removals).catch(() => {});
+    if (!Object.keys(patch).length) return;
+    await chrome.storage.session.set(patch).catch((e) => {
       // Never leave an old record behind to be restored later.
       console.warn("[no-new-tabs] could not save history:", e?.message);
-      if (write === writes) chrome.storage.session.remove(["history", "trimmed", "restoredTabs"]).catch(() => {});
+      if (write === writes) {
+        chrome.storage.session.remove([...history.keys()].map(hkey).concat(["trimmed", "restoredTabs"])).catch(() => {});
+      }
     });
-  }), 0);
+  } finally {
+    saving = false;
+  }
+}
+
+// Dead subframes of a page that never commits a top frame (single-page
+// apps, infinite scroll) pile up to the row cap and get rewritten on every
+// save. Once a minute, rows for frames no longer in the tab are dropped —
+// but only when older than DEAD_FRAME_MS, so a popup opened moments ago is
+// still judged by what its opener showed.
+const PRUNE_EVERY_MS = 60_000;
+const PRUNE_MIN_ENTRIES = 200;
+const DEAD_FRAME_MS = 60_000;
+let lastPrune = 0;
+async function pruneDead() {
+  const now = Date.now();
+  if (now - lastPrune < PRUNE_EVERY_MS) return;
+  lastPrune = now;
+  for (const [id, entries] of history) {
+    if (entries.length < PRUNE_MIN_ENTRIES) continue;
+    const live = await liveFrames(id).catch(() => null);
+    if (!live) continue;
+    const before = entries.length;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (e.f === 0 || e.left != null || live.has(e.f) || now - e.t < DEAD_FRAME_MS) continue;
+      entries.splice(i, 1);
+    }
+    if (entries.length !== before) touchTab(id);
+  }
 }
 
 function forgetGone() {
   const now = Date.now();
+  const forgotten = [];
   for (const [id, at] of gone) {
     if (now - at < 30_000) continue;
     for (const m of [history, menus, gone]) m.delete(id);
     spawned.delete(id);
     trimmed.delete(id);
-    if (restoredTabs.delete(id)) persist();
+    restoredTabs.delete(id);
+    forgotten.push(id);
   }
+  if (forgotten.length) touchGlobals();
+  return forgotten;
 }
 
 // Typed and bookmarked pages are the user's; anything else in the top
@@ -167,9 +259,11 @@ chrome.webNavigation.onCommitted.addListener((d) => {
     if (restoredNow) {
       if (!restoredTabs.has(d.tabId)) {
         restoredTabs.add(d.tabId);
+        touchGlobals();
         persist();
       }
     } else if (restoredTabs.delete(d.tabId)) {
+      touchGlobals();
       persist();
     }
   }
@@ -201,13 +295,16 @@ chrome.webNavigation.onCommitted.addListener((d) => {
     // A cache restore with no visible change still needs its live subframes.
   } else {
     entries.push({ f: d.frameId, p: parent, h, t: d.timeStamp, seq: now });
+    let capped = false;
     if (entries.length > MAX_ENTRIES) {
       // Drop the oldest frame entry. Top-frame entries go last, and only
       // after 1000 changes of site.
       const sub = entries.findIndex((e) => e.f !== 0);
       entries.splice(Math.max(sub, 0), 1);
-      if (sub < 0) trimmed.add(d.tabId);
+      if (sub < 0) { trimmed.add(d.tabId); capped = true; }
     }
+    touchTab(d.tabId);
+    if (capped) touchGlobals();
   }
   persist();
   if (d.frameId === 0 && (d.transitionQualifiers ?? []).includes("forward_back")) {
@@ -229,11 +326,14 @@ chrome.webNavigation.onCommitted.addListener((d) => {
         changed = true;
       }
       if (changed) {
+        let capped = false;
         while (list.length > MAX_ENTRIES) {
           const sub = list.findIndex((e) => e.f !== 0);
           list.splice(Math.max(sub, 0), 1);
-          if (sub < 0) trimmed.add(tabId);
+          if (sub < 0) { trimmed.add(tabId); capped = true; }
         }
+        touchTab(tabId);
+        if (capped) touchGlobals();
         persist();
       }
     }).catch(() => {});
@@ -242,6 +342,7 @@ chrome.webNavigation.onCommitted.addListener((d) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   gone.set(tabId, Date.now());
+  touchGlobals();
   persist();
   setTimeout(persist, 31_000); // forgets it, if the worker is still running
 });
@@ -340,7 +441,8 @@ async function openerWasListed(openerTabId, moment, domains) {
 
 function block(tabId, why) {
   spawned.add(tabId);
-  persist();
+  touchGlobals();
+  persist(true);
   chrome.tabs.remove(tabId).catch(() => {});
   console.info("[no-new-tabs] closed tab", tabId, why);
 }
@@ -455,7 +557,8 @@ async function fromUserMenu(tabId, sourceTabId, sourceFrameId, domains) {
     const fresh = menus.get(sourceTabId);
     if (!fresh || fresh.voided || Date.now() - fresh.t >= MENU_WINDOW_MS || !offeredByMenu(fresh, url)) return false;
     menus.delete(sourceTabId); // one tab per menu
-    persist();
+    touchGlobals();
+    persist(true);
     return true;
   }
   // The browser's own frames, where arm.js can't run (the PDF viewer): a
@@ -536,15 +639,24 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   const id = sender.tab?.id;
-  // arm.js reports context menus on guarded pages.
+  // arm.js reports context menus on guarded pages. The record is capped:
+  // duplicates (currentSrc and src are usually the same address) are
+  // stored once, data: URLs are skipped — a photo inlined as base64 would
+  // blow the storage quota on its own — and each address is cut at about
+  // 2 KB. A data:-image tab opened from the menu is then judged by its
+  // opener instead of matched here.
   if (msg?.type === "contextMenu" && id != null) {
-    const srcs = Array.isArray(msg.srcs) ? msg.srcs.filter((s) => typeof s === "string").slice(0, 20) : [];
+    const srcs = Array.isArray(msg.srcs)
+      ? [...new Set(msg.srcs.filter((s) => typeof s === "string" && s && !s.startsWith("data:")))]
+        .map((s) => s.slice(0, 2048)).slice(0, 20)
+      : [];
     menus.set(id, { selection: String(msg.selection ?? "").slice(0, 500), srcs, t: Date.now() });
-    persist();
+    touchGlobals();
+    persist(true);
     return;
   }
   if (msg?.type === "contextMenuClosed" && id != null) {
-    if (menus.delete(id)) persist();
+    if (menus.delete(id)) { touchGlobals(); persist(true); }
     return;
   }
   // The page dispatched a synthetic click itself after the menu: whatever
@@ -553,7 +665,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     const m = menus.get(id);
     if (m && !m.voided) {
       m.voided = true;
-      persist();
+      touchGlobals();
+      persist(true);
     }
     return;
   }
