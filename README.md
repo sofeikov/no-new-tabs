@@ -226,10 +226,10 @@ set `PORT=` if that is taken.
 CHROME=/usr/bin/chromium PORT=9000 node run.mjs
 ```
 
-The full run takes about eight minutes, most of it waiting for tabs to
+The full run takes about four minutes, most of it waiting for tabs to
 settle. `test/parallel.mjs` splits the same steps across workers — one
 browser and one test server per shard, all assertions identical — which
-brings it down to about two minutes on a many-core machine:
+brings it down to about a minute on a many-core machine:
 
 ```bash
 # from test/

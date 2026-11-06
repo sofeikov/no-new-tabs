@@ -181,7 +181,7 @@ async function launch(extDir, extraArgs = []) {
     executablePath: findChrome(),
     headless: true,
     acceptDownloads: true,
-    args: [`--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`, HOSTS, ...extraArgs],
+    args: [`--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`, "--disable-dev-shm-usage", HOSTS, ...extraArgs],
   });
   sw = context.serviceWorkers()[0] ?? (await context.waitForEvent("serviceworker"));
   await setDomains(["localhost"]);
@@ -199,7 +199,7 @@ const getDomains = () => sw.evaluate(async () => (await chrome.storage.sync.get(
 const pwDriver = () => ({
   click: async (sel, { modifiers, button } = {}) => {
     await page.locator(sel).scrollIntoViewIfNeeded();
-    await page.waitForTimeout(100); // let the page settle after scrolling
+    await page.waitForTimeout(50); // let the page settle after scrolling
     await page.click(sel, { modifiers, button });
   },
   frameClick: (which, sel) => (which === "xframe"
@@ -216,7 +216,26 @@ async function loadStart(url) {
     await page.frameLocator("#xframe-nested").frameLocator("#inner-frame").locator("#frame-open").waitFor();
   }
   await page.evaluate(() => document.fonts.ready.then(() => 1)); // text reflows when fonts arrive
-  await page.waitForTimeout(150); // let arm.js read the domain list
+  await awaitArmed();
+}
+
+// arm.js reads the domain list asynchronously; wait for its verdict (armed
+// on listed pages, guard gone on unlisted ones) instead of a fixed sleep —
+// usually instant, capped above the old wait so slow workers still pass.
+async function awaitArmed(ms = 2000) {
+  for (const end = Date.now() + ms; Date.now() < end; await page.waitForTimeout(50)) {
+    const decided = await page.evaluate(() => window.__noNewTabsGuard?.() === true || window.__noNewTabsGuard === undefined).catch(() => false);
+    if (decided) return;
+  }
+}
+
+// Stricter: wait until the guard reports armed. Needed right after a site
+// is added while the page is open — the removed state (marker absent) would
+// satisfy awaitArmed at once, before the arm signal lands.
+async function awaitArmedOnly(ms = 3000) {
+  for (const end = Date.now() + ms; Date.now() < end; await page.waitForTimeout(50)) {
+    if (await page.evaluate(() => window.__noNewTabsGuard?.() === true).catch(() => false)) return;
+  }
 }
 
 async function openCase(start, action, { reload = true } = {}) {
@@ -234,12 +253,13 @@ async function openCase(start, action, { reload = true } = {}) {
     watch(page);
     return { error: e.message.split("\n")[0] };
   }
-  // Settle fast instead of a fixed wait: stop once the created set is
-  // stable, capped above the old fixed wait so slow closes still count.
+  // Settle fast instead of a fixed wait: tab creation is synchronous with
+  // the click, so stop once the created set is stable, capped so slow
+  // closes on a loaded worker still count.
   let last = "", calm = 0;
   for (const end = Date.now() + 2000; ; await page.waitForTimeout(100)) {
     const snap = created.map((p) => p.isClosed()).join(",");
-    if (snap === last && ++calm >= 8) break;
+    if (snap === last && ++calm >= 5) break;
     if (snap !== last) { last = snap; calm = 0; }
     if (Date.now() >= end) break;
   }
@@ -289,7 +309,7 @@ async function sanity(host, listed) {
   results.push(["click handlers run", (await page.textContent("#btn-count")) === "clicked 2"]);
 
   await page.click("#btn-fetch");
-  await page.waitForTimeout(300);
+  await page.waitForFunction(() => document.getElementById("fetched")?.textContent === "fetched-ok", null, { timeout: 3000 }).catch(() => {});
   results.push(["fetch() works", (await page.textContent("#fetched")) === "fetched-ok"]);
 
   await page.click("#btn-wrap-open");
@@ -304,24 +324,31 @@ async function sanity(host, listed) {
   })]);
 
   await page.click("#btn-request-submit");
-  await page.waitForTimeout(300);
+  await page.waitForFunction(() => window.__ajax === 1, null, { timeout: 3000 }).catch(() => {});
   results.push(["requestSubmit runs the site's submit handler",
     (await page.evaluate(() => window.__ajax)) === 1 && context.pages().length === pagesBefore]);
 
+  // Frame loads land on their own schedule; poll for the marker in the
+  // URL instead of a fixed sleep — usually instant, capped above it.
+  const awaitInner = async (marker) => {
+    for (const end = Date.now() + 3000; Date.now() < end; await page.waitForTimeout(50)) {
+      if (inner()?.url().includes(marker)) return;
+    }
+  };
   await page.click("#link-to-iframe");
-  await page.waitForTimeout(500);
+  await awaitInner("case=in-iframe");
   results.push(["target=<named iframe> loads in iframe", inner()?.url().includes("case=in-iframe") && context.pages().length === pagesBefore]);
 
   await page.click("#btn-open-named-iframe");
-  await page.waitForTimeout(500);
+  await awaitInner("case=open-in-iframe");
   results.push(["window.open into named iframe works", inner()?.url().includes("case=open-in-iframe") && context.pages().length === pagesBefore]);
 
   const sib = page.frameLocator("#sib");
   await sib.locator("#sib-link").click();
-  await page.waitForTimeout(500);
+  await awaitInner("case=sib-link");
   results.push(["sibling frame's link into named iframe", inner()?.url().includes("case=sib-link") && context.pages().length === pagesBefore]);
   await sib.locator("#sib-open").click();
-  await page.waitForTimeout(500);
+  await awaitInner("case=sib-open");
   results.push(["sibling frame's window.open into it", inner()?.url().includes("case=sib-open") && context.pages().length === pagesBefore]);
 
   for (const [name, sel] of [["download link (target=_blank) downloads", "#link-download"],
@@ -329,7 +356,7 @@ async function sanity(host, listed) {
     const download = page.waitForEvent("download", { timeout: 3000 }).catch(() => null);
     await page.click(sel);
     const d = await download;
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(200);
     results.push([name, !!d && context.pages().length === pagesBefore]);
   }
 
@@ -354,13 +381,15 @@ async function sanity(host, listed) {
   // A page that touches an iframe before it loads: code in the iframe must
   // still act on the iframe, not on the page around it.
   await page.goto(`${host}/earlytouch.html`, { waitUntil: "load" });
-  await page.waitForTimeout(300);
   const child = () => page.frames().find((f) => f.url().includes("/child.html") || f.url().includes("case=et-self"));
+  for (const end = Date.now() + 3000; !child() && Date.now() < end; await page.waitForTimeout(50)) {}
   if (!listed) {
     results.push(["early-touched iframe: open() opener is itself", await child()?.evaluate(() => window.__popupOpener()).catch(() => false)]);
   }
   await child()?.evaluate(() => window.__selfOpen()).catch(() => {});
-  await page.waitForTimeout(600);
+  for (const end = Date.now() + 3000; Date.now() < end; await page.waitForTimeout(50)) {
+    if (page.frames().some((f) => f.url().includes("case=et-self"))) break;
+  }
   results.push(["early-touched iframe: open(_self) stays in it",
     page.url().endsWith("/earlytouch.html") && !!page.frames().find((f) => f.url().includes("case=et-self"))]);
 
@@ -382,7 +411,11 @@ async function sanity(host, listed) {
 async function unlistedIsUntouched() {
   console.log("\n=== Unlisted site is untouched ===");
   await page.goto(`${UNLISTED}/index.html`, { waitUntil: "load" });
-  await page.waitForTimeout(300);
+  // The guard removes itself once arm.js reports unlisted; wait for that
+  // instead of a fixed sleep — usually instant, capped above the old wait.
+  for (const end = Date.now() + 2000; Date.now() < end; await page.waitForTimeout(50)) {
+    if (await page.evaluate(() => window.__noNewTabsGuard === undefined).catch(() => false)) break;
+  }
   report("window.open is a plain property again", await page.evaluate(() =>
     "value" in Object.getOwnPropertyDescriptor(window, "open")));
   report("no extension code in DOM call stacks", await page.evaluate(() => {
@@ -427,9 +460,9 @@ async function unlistedIsUntouched() {
 
   // Adding a site arms already-open pages without a reload.
   await page.goto(`${UNLISTED}/index.html`, { waitUntil: "load" });
-  await page.waitForTimeout(300);
+  await awaitArmed();
   await setDomains(["localhost", "127.0.0.1"]);
-  await page.waitForTimeout(300);
+  await awaitArmedOnly(); // the arm signal must land before the no-reload open below
   const r = await openCase(`${UNLISTED}/index.html`, (d) => d.click("#btn-open"), { reload: false });
   report("adding a site applies without reload", r.created === 0 && r.survived === 0);
   const r2 = await openCase(`${UNLISTED}/index.html`, (d) => d.click("#j-static"), { reload: false });
@@ -445,18 +478,25 @@ async function unlistedIsUntouched() {
 async function frameAdoption() {
   console.log("\n=== Inserted frames are adopted anywhere (issue 13) ===");
   await page.goto(`${LISTED}/index.html`, { waitUntil: "load" });
-  await page.waitForTimeout(300);
-  const adopted = await page.evaluate(async () => {
+  await awaitArmed();
+  const markedState = () => page.evaluate(() => {
     const marked = (f) => { try { return "__noNewTabsGuard" in f.contentWindow; } catch { return false; } };
+    return [marked(document.documentElement.firstChild), marked(document.getElementById("adopt-string"))];
+  }).catch(() => [false, false]);
+  await page.evaluate(() => {
     const mid = document.createElement("iframe");
     mid.src = "javascript:false";
     document.documentElement.insertBefore(mid, document.documentElement.firstChild);
     document.body.insertAdjacentHTML("afterbegin", `<iframe src="javascript:false" id="adopt-string"></iframe>`);
-    await new Promise((r) => setTimeout(r, 300));
-    const out = [marked(mid), marked(document.getElementById("adopt-string"))];
-    mid.remove();
+  });
+  // Adoption runs off the DOM mutation; poll instead of a fixed sleep.
+  for (const end = Date.now() + 2000; Date.now() < end; await page.waitForTimeout(50)) {
+    if ((await markedState()).every(Boolean)) break;
+  }
+  const adopted = await markedState();
+  await page.evaluate(() => {
+    document.documentElement.firstChild?.remove();
     document.getElementById("adopt-string")?.remove();
-    return out;
   });
   report("insertBefore at the top is adopted", adopted[0] === true);
   report("string HTML frame is adopted", adopted[1] === true);
@@ -474,7 +514,9 @@ async function insecureSite() {
     report(name, r.created === 0 && r.survived === 0, `(created ${r.created})`);
   }
   await page.goto(unlisted, { waitUntil: "load" });
-  await page.waitForTimeout(300);
+  for (const end = Date.now() + 2000; Date.now() < end; await page.waitForTimeout(50)) {
+    if (await page.evaluate(() => window.__noNewTabsGuard === undefined).catch(() => false)) break;
+  }
   report("unlisted: guard removed", await page.evaluate(() =>
     !isSecureContext && "value" in Object.getOwnPropertyDescriptor(window, "open") && !("__noNewTabsGuard" in window)));
   const r = await openCase(unlisted, (d) => d.click("#btn-open"));
@@ -524,7 +566,10 @@ async function userTabsSurvive() {
     const onPage = (p) => created.push(p);
     context.on("page", onPage);
     await act(b, listedTabId);
-    await page.waitForTimeout(800);
+    // User tabs must survive: wait for one to exist, then give the
+    // background a moment to (not) close it.
+    for (const end = Date.now() + 3000; !created.length && Date.now() < end; await page.waitForTimeout(100)) {}
+    await page.waitForTimeout(300);
     context.off("page", onPage);
     const alive = created.filter((p) => !p.isClosed());
     report(name, created.length >= 1 && alive.length === created.length);
@@ -542,14 +587,18 @@ async function optionsPage() {
   await opts.waitForFunction(() => document.getElementById("list").value === "localhost");
   await opts.fill("#list", "https://www.Example.com/some/path\nlocalhost\nnot a domain!!\nexample.com");
   await opts.click("#save");
-  await opts.waitForTimeout(300);
+  for (const end = Date.now() + 3000; Date.now() < end; await opts.waitForTimeout(50)) {
+    if (JSON.stringify(await getDomains()) === JSON.stringify(["example.com", "localhost"])) break;
+  }
   const saved = await getDomains();
   console.log("saved:", JSON.stringify(saved));
   report("normalises and de-duplicates", JSON.stringify(saved) === JSON.stringify(["example.com", "localhost"]));
 
   const label = await opts.textContent("#add-current");
   await opts.click("#add-current");
-  await opts.waitForTimeout(300);
+  for (const end = Date.now() + 3000; Date.now() < end; await opts.waitForTimeout(50)) {
+    if ((await getDomains()).includes("127.0.0.1")) break;
+  }
   const afterAdd = await getDomains();
   console.log("button:", JSON.stringify(label), " saved:", JSON.stringify(afterAdd));
   report("'Add current domain' button", label.includes("127.0.0.1") && afterAdd.includes("127.0.0.1") && afterAdd.includes("example.com"));
@@ -579,6 +628,45 @@ const rawDriver = () => ({
   },
 });
 
+// Follow a cross-host link and wait for the navigation to commit, instead
+// of a fixed sleep: the commit usually lands in well under 100 ms, and the
+// cap sits above the old wait so slow workers still pass.
+async function rawFollowLink(sel, prefix, ms = 5000) {
+  await rp.click(sel);
+  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
+    if ((await rp.url()).startsWith(prefix)) break;
+  }
+  await rp.waitLoad();
+  await sleep(100);
+}
+
+// The background persists history on a 150 ms debounce; stopping the
+// worker before the load's save lands restores stale rows and misjudges
+// the next popup. Poll for a save stamped after the load — usually one
+// round trip, capped so slow workers still pass.
+async function awaitLoadSaved(url, sinceLoad, ms = 3000) {
+  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
+    const fresh = await raw.swEval(`(async () => {
+      const tab = (await chrome.tabs.query({})).find((t) => t.url === ${JSON.stringify(url)});
+      if (!tab) return false;
+      const rows = (await chrome.storage.session.get("h." + tab.id))["h." + tab.id]?.rows;
+      if (!rows?.length) return false;
+      const last = [...rows].reverse().find((r) => r[0] === 0);
+      return (last?.[3] ?? 0) >= ${sinceLoad};
+    })()`).catch(() => false);
+    if (fresh) return;
+  }
+}
+
+// The raw driver's copy of awaitArmed (background-only pages have no
+// guard, so the marker stays absent and the poll returns at once).
+async function rawArmed(ms = 1500) {
+  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
+    const decided = await rp.eval(`window.__noNewTabsGuard?.() === true || window.__noNewTabsGuard === undefined`).catch(() => false);
+    if (decided) return;
+  }
+}
+
 async function rawLoad(url) {
   await rp.goto(url);
   if (url.endsWith("/index.html")) {
@@ -586,7 +674,7 @@ async function rawLoad(url) {
     await rp.frameEval("nested", "1", false);
   }
   await rp.eval("document.fonts.ready.then(() => 1)");
-  await sleep(150);
+  await rawArmed();
 }
 
 // Run an action on a page; report the page tabs it created and how many
@@ -599,16 +687,16 @@ async function rawCase(action, p = rp) {
     return { error: e.message.split("\n")[0] };
   }
   // Settle fast instead of a fixed wait. Tab creation is synchronous with
-  // the action, so if no target appears within 700 ms none is coming; once
+  // the action, so if no target appears within 400 ms none is coming; once
   // targets exist, stop when the survivor set is stable, capped above the
   // old fixed wait so slow closes on a cold worker are still observed.
   const snapshot = () => raw.pagesSince(since).filter((t) => t.targetId !== p.targetId)
     .map((t) => `${t.targetId}:${!!t.destroyed}`).sort().join(",");
-  for (const end = Date.now() + 700; !snapshot() && Date.now() < end; await sleep(100)) {}
+  for (const end = Date.now() + 400; !snapshot() && Date.now() < end; await sleep(100)) {}
   let last = snapshot(), calm = 0;
   for (const end = Date.now() + 2000; ; await sleep(100)) {
     const snap = snapshot();
-    if (snap === last && ++calm >= 8) break;
+    if (snap === last && ++calm >= 5) break;
     if (snap !== last) { last = snap; calm = 0; }
     if (Date.now() >= end) break;
   }
@@ -663,26 +751,20 @@ async function tabUnder() {
   }
 
   await rawLoad(`${UNLISTED}/index.html`);
-  await rp.click("#link-cross");
-  await sleep(300);
-  await rp.waitLoad();
-  await sleep(150);
+  await rawFollowLink("#link-cross", LISTED);
   const back = await rawCase(() => rp.click("#t-back"));
   report("hidden-frame open, then history.back()", !back.error && back.survived === 0, `(created ${back.created})`);
 
   // window.close() works in a tab with a single history entry.
   const solo = await raw.open(`${LISTED}/index.html`);
-  await sleep(300);
+  await sleep(150);
   const close = await rawCase(() => solo.click("#t-close"), solo);
   report("hidden-frame open, then window.close()", !close.error && close.survived === 0, `(created ${close.created})`);
 
   for (const [name, sel] of [["after a link off a listed site: window.open", "#btn-open"],
     ["after a link off a listed site: hidden frame", "#j-static"]]) {
     await rawLoad(`${LISTED}/index.html`);
-    await rp.click("#link-cross");
-    await sleep(300);
-    await rp.waitLoad();
-    await sleep(300);
+    await rawFollowLink("#link-cross", UNLISTED);
     const r = await rawCase(() => rp.click(sel));
     report(name, (await rp.url()).startsWith(UNLISTED) && r.survived === 1, `(created ${r.created})`);
   }
@@ -694,7 +776,9 @@ async function workerRestart() {
   console.log("\n=== Service worker stopped before the popup ===");
   for (const [name, sel] of [["window.open", "#btn-open"], ["hidden-frame open, then leave", "#t-under-jsf"],
     ["hidden-frame open", "#j-static"], ["hidden-frame open, then 6 redirects", "#t-under-chain"]]) {
+    const sinceLoad = Date.now();
     await rawLoad(`${LISTED}/index.html`);
+    await awaitLoadSaved(`${LISTED}/index.html`, sinceLoad);
     const stopped = await raw.stopSW();
     const r = await rawCase(() => rp.click(sel));
     report(`cold worker: ${name}`, stopped && !r.error && r.survived === 0, `(created ${r.created})`);
@@ -712,8 +796,13 @@ async function listedFrameInUnlistedPage() {
   // The frame leaves, or is removed, right after opening: judged by what it was.
   for (const cold of [false, true]) {
     for (const [name, sel] of [["open, then the frame leaves", "#frame-open-leave"], ["open, then the frame is removed", "#frame-open-remove"]]) {
+      const sinceLoad = Date.now();
       await rawLoad(`${UNLISTED}/index.html`);
-      const stopped = !cold || await raw.stopSW();
+      let stopped = !cold;
+      if (cold) {
+        await awaitLoadSaved(`${UNLISTED}/index.html`, sinceLoad);
+        stopped = await raw.stopSW();
+      }
       const r = await rawCase(() => rawDriver().frameClick("xframe", sel));
       report(`listed iframe: ${name}${cold ? " (cold worker)" : ""}`, stopped && !r.error && r.survived === 0, `(created ${r.created})`);
     }
@@ -734,10 +823,7 @@ async function noSourceTabs() {
   // be closed. If the page was not restored from cache, the exact source
   // path already closes it, so this passes either way.
   await rawLoad(`${UNLISTED}/index.html`);
-  await rp.click("#link-cross");
-  await sleep(300);
-  await rp.waitLoad();
-  await sleep(150);
+  await rawFollowLink("#link-cross", LISTED);
   await rp.eval(`history.back()`);
   await sleep(500);
   await rp.waitLoad();
@@ -757,9 +843,9 @@ async function storageWrites() {
   const tabId = await raw.swEval(`chrome.tabs.query({ url: "${LISTED}/index.html" }).then((t) => t[0]?.id)`);
   await raw.swEval(`globalThis.__sessWrites = []; chrome.storage.onChanged.addListener((c, area) => { if (area === "session") globalThis.__sessWrites.push(Object.keys(c)); });`);
   // Let the load's own save land before measuring.
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 60; i++) {
     const n = await raw.swEval(`globalThis.__sessWrites.length`);
-    await sleep(300);
+    await sleep(100);
     if (await raw.swEval(`globalThis.__sessWrites.length`) === n) break;
   }
   await takeWrites();
@@ -768,7 +854,7 @@ async function storageWrites() {
     document.body.append(f);
     return (async () => { for (let i = 0; i < 6; i++) { f.src = "/target.html?writecount=" + i; await new Promise((r) => setTimeout(r, 10)); } })();
   })()`);
-  await sleep(600);
+  await sleep(400); // the debounce window (150 ms) plus the write itself
   const writes = await takeWrites();
   report("rapid frame commits coalesce into one write", writes.length === 1, `(${writes.length} writes)`);
   report("only the changed tab's key is written", writes.length > 0 && writes.every((k) => k === `h.${tabId}`), `(${writes.join("; ")})`);
@@ -827,7 +913,7 @@ async function menuKept() {
   };
   const words = "zqxj menu words";
   await rawLoad(`${LISTED}/index.html`);
-  await sleep(300); // let the load's own save land: later saves merge, never wipe the seed
+  await sleep(200); // let the load's own save land: later saves merge, never wipe the seed
   const imgUrl = `${UNLISTED}/px.png?realimg`; // resolved against the cross-origin frame
   // A search tab: the query carries the selected words.
   await seedMenu({ selection: words, srcs: [], t: Date.now() });
@@ -863,6 +949,15 @@ async function menuKept() {
   report("301-second-old menu is closed", !old.error && old.survived === 0, `(created ${old.created})`);
 }
 
+// The menu record lands asynchronously after a right-click; poll for a
+// record stamped after the click instead of a fixed sleep — usually
+// instant, capped above the old wait so slow workers still pass.
+async function awaitMenuRecord(record, since, ms = 2000) {
+  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
+    if (((await record().catch(() => null))?.t ?? 0) >= since) return;
+  }
+}
+
 // What the user picks from a context menu opens a tab of their own, but a
 // context menu must not open the door for the page: a link click that gets
 // past the in-page guard right after one is still closed.
@@ -874,7 +969,9 @@ async function contextMenu() {
   report("ctrl+click, closed declarative shadow link", !plain.error && plain.survived === 0, `(created ${plain.created})`);
   await rawLoad(`${LISTED}/v14.html`);
   await rp.click("#ctx-text", { button: "right" });
-  await sleep(400);
+  for (const end = Date.now() + 2000; Date.now() < end; await sleep(50)) {
+    if ((await menus()) === 1) break;
+  }
   report("context menu is reported", (await menus()) === 1);
   const r = await rawCase(() => rp.click("#dcl-host", { modifiers: ["Control"] }));
   report("... the same, right after a context menu", !r.error && r.survived === 0, `(created ${r.created})`);
@@ -895,8 +992,9 @@ async function fakeMenuRecord() {
     getSelection().removeAllRanges();
     getSelection().addRange(range);
   }, true)`);
+  const clickedA = Date.now();
   await rp.click("#menu-attack", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedA);
   report("gesture-time selection is dropped from the record", (await record())?.selection === "");
   const atk = await rawCase(() => rp.eval(`(() => {
     const doc = document.getElementById("jsf-static").contentDocument;
@@ -914,8 +1012,9 @@ async function fakeMenuRecord() {
     getSelection().removeAllRanges();
     getSelection().addRange(range);
   })()`);
+  const clickedB = Date.now();
   await rp.click("#menu-attack", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedB);
   const selB = (await record())?.selection ?? "";
   report("pre-existing selection is kept in the record", selB.includes("zqxj"));
   const voided = await rawCase(() => rp.eval(`(() => {
@@ -927,37 +1026,44 @@ async function fakeMenuRecord() {
   report("synthetic click after a matching record is closed", !voided.error && voided.survived === 0, `(created ${voided.created})`);
   // C. Only loaded, unlinked images are reported.
   await rawLoad(`${LISTED}/index.html`);
+  const clickedReal = Date.now();
   await rp.click("#menu-realimg", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedReal);
   const srcsReal = (await record())?.srcs ?? null;
   report("loaded image is reported once", Array.isArray(srcsReal) && srcsReal.length === 1 && srcsReal[0].includes("px.png?realimg"));
+  const clickedSame = Date.now();
   await rp.click("#menu-sameimg", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedSame);
   const srcsSame = (await record())?.srcs ?? null;
   report("same-link image is not reported", Array.isArray(srcsSame) && !srcsSame.some((u) => u.includes("samelink")));
+  const clickedBroken = Date.now();
   await rp.click("#menu-broken", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedBroken);
   const srcsBroken = (await record())?.srcs ?? null;
   report("broken image is not reported", Array.isArray(srcsBroken) && srcsBroken.length === 0);
   // D. Images composedPath() hides (issue 3): closed shadow root, SVG
   // <image> and <input type=image>. elementFromPoint() still finds the
   // host; the fix steps into the root and collects the new element types.
+  const clickedClosed = Date.now();
   await rp.click("#menu-closed-host", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedClosed);
   const srcsClosed = (await record())?.srcs ?? null;
   report("closed-shadow image is reported once", Array.isArray(srcsClosed) && srcsClosed.length === 1 && srcsClosed[0].includes("px.png?closed-shadow"));
   // Issue 10: data: URLs are skipped in the stored record — a photo inlined
   // as base64 would blow the session-storage quota on its own.
+  const clickedData = Date.now();
   await rp.click("#menu-dataimg", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedData);
   const srcsData = (await record())?.srcs ?? null;
   report("data: image is not stored", Array.isArray(srcsData) && !srcsData.some((u) => u.startsWith("data:")));
+  const clickedSvg = Date.now();
   await rp.click("#menu-svg", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedSvg);
   const srcsSvg = (await record())?.srcs ?? null;
   report("SVG image is reported", Array.isArray(srcsSvg) && srcsSvg.some((u) => u.includes("px.png?svg")));
+  const clickedInput = Date.now();
   await rp.click("#menu-inputimg", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedInput);
   const srcsInput = (await record())?.srcs ?? null;
   report("input image is reported", Array.isArray(srcsInput) && srcsInput.some((u) => u.includes("px.png?input")));
 }
@@ -972,8 +1078,9 @@ async function menuRecordAuthenticity() {
   await rp.eval(`document.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, button: 2 }))`);
   await sleep(400);
   report("synthetic contextmenu is not recorded", (await record()) === null);
+  const clickedAuth = Date.now();
   await rp.click("#menu-realimg", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedAuth);
   const before = await record();
   await rp.frameEval("xframe", `document.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }))`, false);
   await sleep(400);
@@ -991,11 +1098,12 @@ async function docOpenMenus() {
   const record = () => raw.swEval(`chrome.storage.session.get("menus").then((s) => Object.values(s.menus ?? {})[0] ?? null)`);
   // A. The listed page rewrites itself.
   await rawLoad(`${LISTED}/index.html`);
+  const clickedPre = Date.now();
   await rp.click("#menu-attack", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedPre);
   report("menu reported before rewrite", !!(await record()));
   await rp.eval(`document.open(); document.write('<p id="rewritten">zqxj rewritten selection words</p>'); document.close();`);
-  await sleep(400);
+  await sleep(200); // the observer re-attaches the control listeners dropped by the rewrite
   await rp.eval(`(() => {
     const el = document.getElementById("rewritten");
     const range = document.createRange();
@@ -1003,8 +1111,9 @@ async function docOpenMenus() {
     getSelection().removeAllRanges();
     getSelection().addRange(range);
   })()`);
+  const clickedPost = Date.now();
   await rp.click("#rewritten", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedPost);
   report("menu reported after document.open()", ((await record())?.selection ?? "").includes("rewritten"));
   // B. An editor-style same-origin iframe written with document.open().
   await rawLoad(`${LISTED}/index.html`);
@@ -1012,7 +1121,7 @@ async function docOpenMenus() {
     const doc = document.getElementById("sib").contentDocument;
     doc.open(); doc.write('<p id="ed">zqxj editor selection words</p>'); doc.close();
   })()`);
-  await sleep(400);
+  await sleep(200); // the observer re-attaches the control listeners dropped by the rewrite
   await rp.eval(`(() => {
     const win = document.getElementById("sib").contentWindow;
     const el = win.document.getElementById("ed");
@@ -1021,15 +1130,18 @@ async function docOpenMenus() {
     win.getSelection().removeAllRanges();
     win.getSelection().addRange(range);
   })()`);
+  const clickedEd = Date.now();
   await rp.clickIn("#sib", "#ed", { button: "right" });
-  await sleep(400);
+  await awaitMenuRecord(record, clickedEd);
   report("menu reported in rewritten iframe", ((await record())?.selection ?? "").includes("editor"));
   // C. A page rewritten while unlisted arms once its site is listed.
   await rawLoad(`${UNLISTED}/index.html`);
   await rp.eval(`document.open(); document.write('<p id="q">rewritten while unlisted</p>'); document.close();`);
-  await sleep(400);
+  await sleep(200); // the observer re-attaches the control listeners dropped by the rewrite
   await raw.setDomains(["localhost", "127.0.0.1"]);
-  await sleep(400);
+  for (const end = Date.now() + 2000; Date.now() < end; await sleep(50)) {
+    if (await rp.eval("window.__noNewTabsGuard?.() === true").catch(() => false)) break;
+  }
   report("rewritten unlisted page arms when listed", await rp.eval("window.__noNewTabsGuard?.() === true"));
   await raw.setDomains(["localhost"]);
 }
@@ -1144,9 +1256,12 @@ async function unreachedFrames() {
       f.id = "h-opaque";
       f.setAttribute("sandbox", "allow-popups allow-forms");
       f.src = "/opaque.html";
+      f.addEventListener("load", () => window.__opaqueLoaded = true);
       document.body.append(f);
     })()`);
-    await sleep(800);
+    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+      if (await rp.eval(`window.__opaqueLoaded === true`).catch(() => false)) break;
+    }
     await rp.clickIn("#h-opaque", "a");
   });
   report("opaque sandbox _blank click", !r.error && r.created === 0, `(created ${r.created})`);
@@ -1209,7 +1324,9 @@ async function overblocking() {
       a.addEventListener("click", function () { this.target = "_self"; });
     })()`);
     await rp.click("#h-self");
-    await sleep(500);
+    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+      if ((await rp.url()).includes("h-selflink")) break;
+    }
   });
   report("late _self switch on link", !r.error && r.created === 0 && (await rp.url()).includes("h-selflink"),
     `(created ${r.created}, url ${(await rp.url()).split("/").pop()})`);
@@ -1227,7 +1344,9 @@ async function overblocking() {
       f.addEventListener("submit", function () { this.target = "_self"; });
     })()`);
     await rp.click("#h-selfb");
-    await sleep(500);
+    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+      if ((await rp.url()).includes("h-selff")) break;
+    }
   });
   report("late _self switch on form", !r.error && r.created === 0 && (await rp.url()).includes("h-selff"),
     `(created ${r.created}, url ${(await rp.url()).split("?")[0].split("/").pop()})`);
@@ -1243,7 +1362,9 @@ async function overblocking() {
       f.addEventListener("load", () => window.__frLoads++);
       document.body.append(f);
     })()`);
-    await sleep(800);
+    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+      if (await rp.eval(`window.__frLoads >= 1`).catch(() => false)) break;
+    }
     await rp.eval(`(() => {
       const a = document.createElement("a");
       a.id = "h-frgo";
@@ -1253,7 +1374,9 @@ async function overblocking() {
       document.body.append(a);
     })()`);
     await rp.click("#h-frgo");
-    await sleep(800);
+    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+      if (await rp.eval(`window.__frLoads >= 2`).catch(() => false)) break;
+    }
   });
   const frLoads = await rp.eval(`window.__frLoads`);
   report("named iframe showing another site", !r.error && r.created === 0 && frLoads >= 2,
@@ -1269,12 +1392,16 @@ async function overblocking() {
       document.body.append(f);
       window.__f = f;
     })()`);
-    await sleep(800);
+    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+      if ((await rp.eval(`window.__f?.contentWindow?.location?.href`).catch(() => ""))?.includes("h-abhost")) break;
+    }
     await rp.eval(`(() => {
       window.__hrefBefore = window.__f.contentWindow.location.href;
       window.open("about:blank", "h-ab");
     })()`);
-    await sleep(300);
+    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+      if (await rp.eval(`window.__f.contentWindow.location.href === "about:blank"`).catch(() => false)) break;
+    }
   });
   const hrefs = await rp.eval(`({ before: window.__hrefBefore, after: window.__f.contentWindow.location.href })`);
   report("about:blank resets named frame", !r.error && r.created === 0 && hrefs.after === "about:blank",
@@ -1298,7 +1425,10 @@ async function liveArmNoInput() {
   console.log("\n=== Adding a site guards hidden frames before any input (popup blocker off) ===");
   await rawLoad(`${UNLISTED}/index.html`);
   await raw.setDomains(["localhost", "127.0.0.1"]);
-  await sleep(400);
+  // The arm signal must land before the guarded open below; poll for it.
+  for (const end = Date.now() + 3000; Date.now() < end; await sleep(50)) {
+    if (await rp.eval(`window.__noNewTabsGuard?.() === true`).catch(() => false)) break;
+  }
   const r = await rawCase(() => rp.eval(`void __byName("jsfstatic").open("/target.html?case=live-arm-jsf")`));
   report("hidden frame's open, no input", !r.error && r.created === 0, `(created ${r.created})`);
   await raw.setDomains(["localhost"]);
