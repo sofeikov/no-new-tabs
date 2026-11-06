@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "No New Tabs",
-  "version": "1.5.10",
+  "version": "1.5.11",
   "description": "Listed domains cannot open new tabs or windows. JavaScript on those sites keeps working.",
   "permissions": [
     "tabs",

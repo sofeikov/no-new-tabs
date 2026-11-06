@@ -255,13 +255,15 @@ node --test unit.mjs
 
 Time-driven background behavior the headless suite cannot reach
 (pruning 60 s after a frame leaves, cold-worker restore, dead-frame
-pruning) runs against the shipped `background.js` through a fake
-`chrome` API ([harness.mjs](test/harness.mjs)) instead
-([unit-prune.mjs](test/unit-prune.mjs)):
+pruning, the no-source fallbacks) runs against the shipped
+`background.js` through a fake `chrome` API
+([harness.mjs](test/harness.mjs)) instead
+([unit-prune.mjs](test/unit-prune.mjs),
+[unit-fallbacks.mjs](test/unit-fallbacks.mjs)):
 
 ```bash
 # from test/
-node --test unit-prune.mjs
+node --test unit-prune.mjs unit-fallbacks.mjs
 ```
 
 The suite lists `localhost`, uses `127.0.0.1` as the unlisted control, and
