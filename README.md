@@ -344,6 +344,10 @@ test/
     data.json       Used by the fetch() check
 ```
 
+[ARCHITECTURE.md](ARCHITECTURE.md) is the post-review design note:
+verdicts on the two layers, injection scope and background state, the
+measured cost of the guard, and the follow-up issues.
+
 ## How it works: every trick
 
 Each trick below follows the same pattern: the problem or attack, what the

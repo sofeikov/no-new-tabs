@@ -354,33 +354,30 @@
   // click then does nothing instead of flashing. Left alone when the frame
   // can run scripts (its own guard copy covers it) or is same-origin (the
   // parent's adoption covers it).
-  const hasSandboxToken = (value, token) => {
+  // Split on ASCII whitespace, the way the browser splits sandbox tokens.
+  // Returning false stops the walk. Empty runs never reach the callback.
+  const eachToken = (value, fn) => {
     const s = `${value ?? ""}`;
     let cur = "";
     for (let i = 0; i <= s.length; i++) {
       const c = i < s.length ? charAt(s, i) : 32;
       if (c === 32 || c === 9 || c === 10 || c === 12 || c === 13) {
-        if (toLower(cur) === token) return true;
+        if (cur !== "" && fn(cur) === false) return;
         cur = "";
       } else cur += s[i];
     }
-    return false;
+  };
+  const hasSandboxToken = (value, token) => {
+    let found = false;
+    eachToken(value, (cur) => { if (toLower(cur) === token) { found = true; return false; } });
+    return found;
   };
   const stripPopups = (value) => {
     const s = `${value ?? ""}`;
     if (!hasSandboxToken(s, "allow-popups")) return s;
     if (hasSandboxToken(s, "allow-scripts") || hasSandboxToken(s, "allow-same-origin")) return s;
-    let out = "", cur = "";
-    const flush = () => {
-      if (cur !== "" && toLower(cur) !== "allow-popups") out += (out === "" ? "" : " ") + cur;
-      cur = "";
-    };
-    for (let i = 0; i <= s.length; i++) {
-      const c = i < s.length ? charAt(s, i) : 32;
-      if (c === 32 || c === 9 || c === 10 || c === 12 || c === 13) flush();
-      else cur += s[i];
-    }
-    flush();
+    let out = "";
+    eachToken(s, (cur) => { if (toLower(cur) !== "allow-popups") out += (out === "" ? "" : " ") + cur; });
     return out;
   };
   const tameSandbox = (el) => {
