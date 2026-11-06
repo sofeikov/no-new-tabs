@@ -1235,6 +1235,65 @@ async function hardening() {
     await rp.click("#h-fn");
   });
   report("replaced window.Function document.open()", !r.error && r.created === 0, `(created ${r.created})`);
+  // 6. A replaced Function.prototype.apply: the guard saved Reflect.apply
+  // before any page script ran, so the _blank click is still stopped.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      Function.prototype.apply = function () { throw new Error("poisoned"); };
+      try { (function () {}).apply(null, []); } catch { window.__tamper = "apply"; }
+    })()`);
+    await rp.click("#link-blank");
+  });
+  report("poisoned Function.prototype.apply _blank click",
+    !r.error && r.created === 0 && await rp.eval(`window.__tamper`) === "apply", `(created ${r.created})`);
+  // 7. Replaced WeakMap/WeakSet methods: the guard uncurried them at
+  // install time, so its bookkeeping still works.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      for (const [proto, keys] of [[WeakMap.prototype, ["get", "set", "has", "delete"]], [WeakSet.prototype, ["add", "has"]]]) {
+        for (const k of keys) proto[k] = function () { throw new Error("poisoned"); };
+      }
+      try { new WeakMap().set({}, 1); } catch { window.__tamper = "weakmap"; }
+    })()`);
+    await rp.click("#link-blank");
+  });
+  report("poisoned WeakMap/WeakSet methods _blank click",
+    !r.error && r.created === 0 && await rp.eval(`window.__tamper`) === "weakmap", `(created ${r.created})`);
+  // 8. A lying Event.prototype.composedPath: the guard reads the saved
+  // copy, so it still finds the link inside the closed shadow root.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      Event.prototype.composedPath = function () { return []; };
+      window.__tamper = new MouseEvent("click").composedPath().length === 0 ? "path" : "no";
+    })()`);
+    await rp.click("#shadow-link-host");
+  });
+  report("lying composedPath closed-shadow _blank click",
+    !r.error && r.created === 0 && await rp.eval(`window.__tamper`) === "path", `(created ${r.created})`);
+  // 9. A lying defaultPrevented getter: the guard reads the saved copy, so
+  // it does not mistake the click for already handled.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      Object.defineProperty(Event.prototype, "defaultPrevented", { configurable: true, get() { return true; } });
+      window.__tamper = new MouseEvent("click").defaultPrevented === true ? "prevented" : "no";
+    })()`);
+    await rp.click("#link-blank");
+  });
+  report("lying defaultPrevented _blank click",
+    !r.error && r.created === 0 && await rp.eval(`window.__tamper`) === "prevented", `(created ${r.created})`);
+  // 10-11. Control characters around the scheme: the parser ignores them
+  // like the URL parser does, so the _self open is still refused.
+  for (const [name, url] of [["control-char about:blank _self", "\x01about:blank"], ["tab-in-scheme _self", "ab\tout:blank"]]) {
+    await rawLoad(`${LISTED}/index.html`);
+    const before = await rp.url();
+    r = await rawCase(() => rp.eval(`window.open(${JSON.stringify(url)}, "_self")`, { gesture: true }));
+    report(`${name} open`, !r.error && r.created === 0 && await rp.url() === before,
+      `(created ${r.created}, stayed ${await rp.url() === before})`);
+  }
 }
 
 // Issue 9: frames the guard can't reach. Dense same-process sampling
