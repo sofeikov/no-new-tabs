@@ -19,7 +19,8 @@ export async function launchRaw(chrome, extDir, extraArgs = []) {
   const profile = mkdtempSync(join(tmpdir(), "nnt-raw-"));
   const proc = spawn(chrome, [
     "--headless=new", `--user-data-dir=${profile}`, "--remote-debugging-port=0", "--no-first-run",
-    "--no-default-browser-check", `--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`,
+    "--no-default-browser-check", "--disable-dev-shm-usage", "--disable-background-networking",
+    `--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`,
     ...extraArgs, "about:blank",
   ], { stdio: "ignore" });
 
@@ -169,7 +170,7 @@ export async function launchRaw(chrome, extDir, extraArgs = []) {
     // ... on the centre of an element.
     page.click = async (selector, opts) => {
       await page.eval(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({ block: "center" })`);
-      await sleep(100); // let the page settle after scrolling
+      await sleep(50); // let the page settle after scrolling
       const [x, y] = await page.eval(`(() => {
         const r = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
         return [r.x + r.width / 2, r.y + r.height / 2];
@@ -181,7 +182,7 @@ export async function launchRaw(chrome, extDir, extraArgs = []) {
     // frame's top left.
     page.clickIn = async (frameSelector, selector, opts) => {
       await page.eval(`document.querySelector(${JSON.stringify(frameSelector)}).scrollIntoView({ block: "center" })`);
-      await sleep(100);
+      await sleep(50);
       const [x, y] = await page.eval(`(() => {
         const f = document.querySelector(${JSON.stringify(frameSelector)});
         const fr = f.getBoundingClientRect();
