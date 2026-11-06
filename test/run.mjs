@@ -219,23 +219,34 @@ async function loadStart(url) {
   await awaitArmed();
 }
 
+// Poll for a condition instead of a fixed sleep: resolves as soon as the
+// page or worker is ready, capped so slow workers still pass.
+async function pollPage(p, fn, ms = 2000) {
+  for (const end = Date.now() + ms; Date.now() < end; await p.waitForTimeout(50)) {
+    try { if (await fn()) return true; } catch {}
+  }
+  return false;
+}
+async function poll(fn, ms = 2000) {
+  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
+    try { if (await fn()) return true; } catch {}
+  }
+  return false;
+}
+
 // arm.js reads the domain list asynchronously; wait for its verdict (armed
 // on listed pages, guard gone on unlisted ones) instead of a fixed sleep —
 // usually instant, capped above the old wait so slow workers still pass.
 async function awaitArmed(ms = 2000) {
-  for (const end = Date.now() + ms; Date.now() < end; await page.waitForTimeout(50)) {
-    const decided = await page.evaluate(() => window.__noNewTabsGuard?.() === true || window.__noNewTabsGuard === undefined).catch(() => false);
-    if (decided) return;
-  }
+  await pollPage(page, () => page.evaluate(
+    () => window.__noNewTabsGuard?.() === true || window.__noNewTabsGuard === undefined).catch(() => false), ms);
 }
 
 // Stricter: wait until the guard reports armed. Needed right after a site
 // is added while the page is open — the removed state (marker absent) would
 // satisfy awaitArmed at once, before the arm signal lands.
 async function awaitArmedOnly(ms = 3000) {
-  for (const end = Date.now() + ms; Date.now() < end; await page.waitForTimeout(50)) {
-    if (await page.evaluate(() => window.__noNewTabsGuard?.() === true).catch(() => false)) return;
-  }
+  await pollPage(page, () => page.evaluate(() => window.__noNewTabsGuard?.() === true).catch(() => false), ms);
 }
 
 async function openCase(start, action, { reload = true } = {}) {
@@ -330,11 +341,7 @@ async function sanity(host, listed) {
 
   // Frame loads land on their own schedule; poll for the marker in the
   // URL instead of a fixed sleep — usually instant, capped above it.
-  const awaitInner = async (marker) => {
-    for (const end = Date.now() + 3000; Date.now() < end; await page.waitForTimeout(50)) {
-      if (inner()?.url().includes(marker)) return;
-    }
-  };
+  const awaitInner = (marker) => pollPage(page, () => inner()?.url().includes(marker), 3000);
   await page.click("#link-to-iframe");
   await awaitInner("case=in-iframe");
   results.push(["target=<named iframe> loads in iframe", inner()?.url().includes("case=in-iframe") && context.pages().length === pagesBefore]);
@@ -382,14 +389,12 @@ async function sanity(host, listed) {
   // still act on the iframe, not on the page around it.
   await page.goto(`${host}/earlytouch.html`, { waitUntil: "load" });
   const child = () => page.frames().find((f) => f.url().includes("/child.html") || f.url().includes("case=et-self"));
-  for (const end = Date.now() + 3000; !child() && Date.now() < end; await page.waitForTimeout(50)) {}
+  await pollPage(page, () => !!child(), 3000);
   if (!listed) {
     results.push(["early-touched iframe: open() opener is itself", await child()?.evaluate(() => window.__popupOpener()).catch(() => false)]);
   }
   await child()?.evaluate(() => window.__selfOpen()).catch(() => {});
-  for (const end = Date.now() + 3000; Date.now() < end; await page.waitForTimeout(50)) {
-    if (page.frames().some((f) => f.url().includes("case=et-self"))) break;
-  }
+  await pollPage(page, () => page.frames().some((f) => f.url().includes("case=et-self")), 3000);
   results.push(["early-touched iframe: open(_self) stays in it",
     page.url().endsWith("/earlytouch.html") && !!page.frames().find((f) => f.url().includes("case=et-self"))]);
 
@@ -413,9 +418,7 @@ async function unlistedIsUntouched() {
   await page.goto(`${UNLISTED}/index.html`, { waitUntil: "load" });
   // The guard removes itself once arm.js reports unlisted; wait for that
   // instead of a fixed sleep — usually instant, capped above the old wait.
-  for (const end = Date.now() + 2000; Date.now() < end; await page.waitForTimeout(50)) {
-    if (await page.evaluate(() => window.__noNewTabsGuard === undefined).catch(() => false)) break;
-  }
+  await pollPage(page, () => page.evaluate(() => window.__noNewTabsGuard === undefined).catch(() => false));
   report("window.open is a plain property again", await page.evaluate(() =>
     "value" in Object.getOwnPropertyDescriptor(window, "open")));
   report("no extension code in DOM call stacks", await page.evaluate(() => {
@@ -490,9 +493,7 @@ async function frameAdoption() {
     document.body.insertAdjacentHTML("afterbegin", `<iframe src="javascript:false" id="adopt-string"></iframe>`);
   });
   // Adoption runs off the DOM mutation; poll instead of a fixed sleep.
-  for (const end = Date.now() + 2000; Date.now() < end; await page.waitForTimeout(50)) {
-    if ((await markedState()).every(Boolean)) break;
-  }
+  await pollPage(page, async () => (await markedState()).every(Boolean));
   const adopted = await markedState();
   await page.evaluate(() => {
     document.documentElement.firstChild?.remove();
@@ -514,9 +515,7 @@ async function insecureSite() {
     report(name, r.created === 0 && r.survived === 0, `(created ${r.created})`);
   }
   await page.goto(unlisted, { waitUntil: "load" });
-  for (const end = Date.now() + 2000; Date.now() < end; await page.waitForTimeout(50)) {
-    if (await page.evaluate(() => window.__noNewTabsGuard === undefined).catch(() => false)) break;
-  }
+  await pollPage(page, () => page.evaluate(() => window.__noNewTabsGuard === undefined).catch(() => false));
   report("unlisted: guard removed", await page.evaluate(() =>
     !isSecureContext && "value" in Object.getOwnPropertyDescriptor(window, "open") && !("__noNewTabsGuard" in window)));
   const r = await openCase(unlisted, (d) => d.click("#btn-open"));
@@ -568,7 +567,7 @@ async function userTabsSurvive() {
     await act(b, listedTabId);
     // User tabs must survive: wait for one to exist, then give the
     // background a moment to (not) close it.
-    for (const end = Date.now() + 3000; !created.length && Date.now() < end; await page.waitForTimeout(100)) {}
+    await pollPage(page, () => created.length > 0, 3000);
     await page.waitForTimeout(300);
     context.off("page", onPage);
     const alive = created.filter((p) => !p.isClosed());
@@ -587,18 +586,14 @@ async function optionsPage() {
   await opts.waitForFunction(() => document.getElementById("list").value === "localhost");
   await opts.fill("#list", "https://www.Example.com/some/path\nlocalhost\nnot a domain!!\nexample.com");
   await opts.click("#save");
-  for (const end = Date.now() + 3000; Date.now() < end; await opts.waitForTimeout(50)) {
-    if (JSON.stringify(await getDomains()) === JSON.stringify(["example.com", "localhost"])) break;
-  }
+  await pollPage(opts, async () => JSON.stringify(await getDomains()) === JSON.stringify(["example.com", "localhost"]), 3000);
   const saved = await getDomains();
   console.log("saved:", JSON.stringify(saved));
   report("normalises and de-duplicates", JSON.stringify(saved) === JSON.stringify(["example.com", "localhost"]));
 
   const label = await opts.textContent("#add-current");
   await opts.click("#add-current");
-  for (const end = Date.now() + 3000; Date.now() < end; await opts.waitForTimeout(50)) {
-    if ((await getDomains()).includes("127.0.0.1")) break;
-  }
+  await pollPage(opts, async () => (await getDomains()).includes("127.0.0.1"), 3000);
   const afterAdd = await getDomains();
   console.log("button:", JSON.stringify(label), " saved:", JSON.stringify(afterAdd));
   report("'Add current domain' button", label.includes("127.0.0.1") && afterAdd.includes("127.0.0.1") && afterAdd.includes("example.com"));
@@ -623,7 +618,7 @@ const rawDriver = () => ({
   frameClick: (which, sel) => rp.frameEval(which, `document.querySelector(${JSON.stringify(sel)}).click()`),
   clickIn: (frameSel, sel, opts) => rp.clickIn(frameSel, sel, opts),
   waitUrl: async (re) => {
-    for (const end = Date.now() + 5000; Date.now() < end; await sleep(50)) if (re.test(await rp.url())) break;
+    await poll(async () => re.test(await rp.url()), 5000);
     await rp.waitLoad();
   },
 });
@@ -633,9 +628,7 @@ const rawDriver = () => ({
 // cap sits above the old wait so slow workers still pass.
 async function rawFollowLink(sel, prefix, ms = 5000) {
   await rp.click(sel);
-  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
-    if ((await rp.url()).startsWith(prefix)) break;
-  }
+  await poll(async () => (await rp.url()).startsWith(prefix), ms);
   await rp.waitLoad();
   await sleep(100);
 }
@@ -645,26 +638,20 @@ async function rawFollowLink(sel, prefix, ms = 5000) {
 // the next popup. Poll for a save stamped after the load — usually one
 // round trip, capped so slow workers still pass.
 async function awaitLoadSaved(url, sinceLoad, ms = 3000) {
-  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
-    const fresh = await raw.swEval(`(async () => {
-      const tab = (await chrome.tabs.query({})).find((t) => t.url === ${JSON.stringify(url)});
-      if (!tab) return false;
-      const rows = (await chrome.storage.session.get("h." + tab.id))["h." + tab.id]?.rows;
-      if (!rows?.length) return false;
-      const last = [...rows].reverse().find((r) => r[0] === 0);
-      return (last?.[3] ?? 0) >= ${sinceLoad};
-    })()`).catch(() => false);
-    if (fresh) return;
-  }
+  await poll(() => raw.swEval(`(async () => {
+    const tab = (await chrome.tabs.query({})).find((t) => t.url === ${JSON.stringify(url)});
+    if (!tab) return false;
+    const rows = (await chrome.storage.session.get("h." + tab.id))["h." + tab.id]?.rows;
+    if (!rows?.length) return false;
+    const last = [...rows].reverse().find((r) => r[0] === 0);
+    return (last?.[3] ?? 0) >= ${sinceLoad};
+  })()`).catch(() => false), ms);
 }
 
 // The raw driver's copy of awaitArmed (background-only pages have no
 // guard, so the marker stays absent and the poll returns at once).
 async function rawArmed(ms = 1500) {
-  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
-    const decided = await rp.eval(`window.__noNewTabsGuard?.() === true || window.__noNewTabsGuard === undefined`).catch(() => false);
-    if (decided) return;
-  }
+  await poll(() => rp.eval(`window.__noNewTabsGuard?.() === true || window.__noNewTabsGuard === undefined`).catch(() => false), ms);
 }
 
 async function rawLoad(url) {
@@ -953,9 +940,7 @@ async function menuKept() {
 // record stamped after the click instead of a fixed sleep — usually
 // instant, capped above the old wait so slow workers still pass.
 async function awaitMenuRecord(record, since, ms = 2000) {
-  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
-    if (((await record().catch(() => null))?.t ?? 0) >= since) return;
-  }
+  await poll(async () => ((await record().catch(() => null))?.t ?? 0) >= since, ms);
 }
 
 // What the user picks from a context menu opens a tab of their own, but a
@@ -969,9 +954,7 @@ async function contextMenu() {
   report("ctrl+click, closed declarative shadow link", !plain.error && plain.survived === 0, `(created ${plain.created})`);
   await rawLoad(`${LISTED}/v14.html`);
   await rp.click("#ctx-text", { button: "right" });
-  for (const end = Date.now() + 2000; Date.now() < end; await sleep(50)) {
-    if ((await menus()) === 1) break;
-  }
+  await poll(async () => (await menus()) === 1);
   report("context menu is reported", (await menus()) === 1);
   const r = await rawCase(() => rp.click("#dcl-host", { modifiers: ["Control"] }));
   report("... the same, right after a context menu", !r.error && r.survived === 0, `(created ${r.created})`);
@@ -1139,9 +1122,7 @@ async function docOpenMenus() {
   await rp.eval(`document.open(); document.write('<p id="q">rewritten while unlisted</p>'); document.close();`);
   await sleep(200); // the observer re-attaches the control listeners dropped by the rewrite
   await raw.setDomains(["localhost", "127.0.0.1"]);
-  for (const end = Date.now() + 2000; Date.now() < end; await sleep(50)) {
-    if (await rp.eval("window.__noNewTabsGuard?.() === true").catch(() => false)) break;
-  }
+  await poll(() => rp.eval("window.__noNewTabsGuard?.() === true").catch(() => false));
   report("rewritten unlisted page arms when listed", await rp.eval("window.__noNewTabsGuard?.() === true"));
   await raw.setDomains(["localhost"]);
 }
@@ -1318,9 +1299,7 @@ async function unreachedFrames() {
       f.addEventListener("load", () => window.__opaqueLoaded = true);
       document.body.append(f);
     })()`);
-    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
-      if (await rp.eval(`window.__opaqueLoaded === true`).catch(() => false)) break;
-    }
+    await poll(() => rp.eval(`window.__opaqueLoaded === true`).catch(() => false), 4000);
     await rp.clickIn("#h-opaque", "a");
   });
   report("opaque sandbox _blank click", !r.error && r.created === 0, `(created ${r.created})`);
@@ -1383,9 +1362,7 @@ async function overblocking() {
       a.addEventListener("click", function () { this.target = "_self"; });
     })()`);
     await rp.click("#h-self");
-    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
-      if ((await rp.url()).includes("h-selflink")) break;
-    }
+    await poll(async () => (await rp.url()).includes("h-selflink"), 4000);
   });
   report("late _self switch on link", !r.error && r.created === 0 && (await rp.url()).includes("h-selflink"),
     `(created ${r.created}, url ${(await rp.url()).split("/").pop()})`);
@@ -1403,9 +1380,7 @@ async function overblocking() {
       f.addEventListener("submit", function () { this.target = "_self"; });
     })()`);
     await rp.click("#h-selfb");
-    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
-      if ((await rp.url()).includes("h-selff")) break;
-    }
+    await poll(async () => (await rp.url()).includes("h-selff"), 4000);
   });
   report("late _self switch on form", !r.error && r.created === 0 && (await rp.url()).includes("h-selff"),
     `(created ${r.created}, url ${(await rp.url()).split("?")[0].split("/").pop()})`);
@@ -1421,9 +1396,7 @@ async function overblocking() {
       f.addEventListener("load", () => window.__frLoads++);
       document.body.append(f);
     })()`);
-    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
-      if (await rp.eval(`window.__frLoads >= 1`).catch(() => false)) break;
-    }
+    await poll(() => rp.eval(`window.__frLoads >= 1`).catch(() => false), 4000);
     await rp.eval(`(() => {
       const a = document.createElement("a");
       a.id = "h-frgo";
@@ -1433,9 +1406,7 @@ async function overblocking() {
       document.body.append(a);
     })()`);
     await rp.click("#h-frgo");
-    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
-      if (await rp.eval(`window.__frLoads >= 2`).catch(() => false)) break;
-    }
+    await poll(() => rp.eval(`window.__frLoads >= 2`).catch(() => false), 4000);
   });
   const frLoads = await rp.eval(`window.__frLoads`);
   report("named iframe showing another site", !r.error && r.created === 0 && frLoads >= 2,
@@ -1451,16 +1422,12 @@ async function overblocking() {
       document.body.append(f);
       window.__f = f;
     })()`);
-    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
-      if ((await rp.eval(`window.__f?.contentWindow?.location?.href`).catch(() => ""))?.includes("h-abhost")) break;
-    }
+    await poll(async () => ((await rp.eval(`window.__f?.contentWindow?.location?.href`).catch(() => ""))?.includes("h-abhost")), 4000);
     await rp.eval(`(() => {
       window.__hrefBefore = window.__f.contentWindow.location.href;
       window.open("about:blank", "h-ab");
     })()`);
-    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
-      if (await rp.eval(`window.__f.contentWindow.location.href === "about:blank"`).catch(() => false)) break;
-    }
+    await poll(() => rp.eval(`window.__f.contentWindow.location.href === "about:blank"`).catch(() => false), 4000);
   });
   const hrefs = await rp.eval(`({ before: window.__hrefBefore, after: window.__f.contentWindow.location.href })`);
   report("about:blank resets named frame", !r.error && r.created === 0 && hrefs.after === "about:blank",
@@ -1485,9 +1452,7 @@ async function liveArmNoInput() {
   await rawLoad(`${UNLISTED}/index.html`);
   await raw.setDomains(["localhost", "127.0.0.1"]);
   // The arm signal must land before the guarded open below; poll for it.
-  for (const end = Date.now() + 3000; Date.now() < end; await sleep(50)) {
-    if (await rp.eval(`window.__noNewTabsGuard?.() === true`).catch(() => false)) break;
-  }
+  await poll(() => rp.eval(`window.__noNewTabsGuard?.() === true`).catch(() => false), 3000);
   const r = await rawCase(() => rp.eval(`void __byName("jsfstatic").open("/target.html?case=live-arm-jsf")`));
   report("hidden frame's open, no input", !r.error && r.created === 0, `(created ${r.created})`);
   await raw.setDomains(["localhost"]);
