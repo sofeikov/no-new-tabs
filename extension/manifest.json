@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "No New Tabs",
-  "version": "1.5.12",
+  "version": "1.6.0",
   "description": "Listed domains cannot open new tabs or windows. JavaScript on those sites keeps working.",
   "permissions": [
     "tabs",
@@ -31,6 +31,7 @@
     },
     {
       "js": [
+        "match.js",
         "arm.js"
       ],
       "matches": [

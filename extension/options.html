@@ -8,18 +8,30 @@
     textarea { width: 100%; height: 240px; font: 13px ui-monospace, monospace; padding: 8px; box-sizing: border-box; }
     button { margin-top: 10px; padding: 7px 16px; font: inherit; cursor: pointer; }
     .hint { color: #666; }
+    .rules { color: #666; margin: 0 0 12px; padding-left: 20px; }
+    .rules code { color: #222; }
     #saved { margin-left: 10px; color: #2e7d32; }
+    #error { color: #c62828; margin-top: 10px; white-space: pre-wrap; }
+    #error ul { margin: 4px 0 0; padding-left: 20px; font: 13px ui-monospace, monospace; }
     #add-current { margin: 0 0 10px; }
   </style>
 </head>
 <body>
   <h1>No New Tabs</h1>
-  <p class="hint">One domain per line. A domain also covers its subdomains, so
-    <code>example.com</code> covers <code>www.example.com</code> and <code>app.example.com</code>.
-    Pages on these sites cannot open new tabs or windows. Reload open tabs after saving.</p>
+  <p class="hint">Pages on listed sites cannot open new tabs or windows. One rule per line:</p>
+  <ul class="rules">
+    <li><code>example.com</code>: the site and its subdomains (<code>www.example.com</code>, <code>app.example.com</code>)</li>
+    <li><code>=app.example.com</code>: that exact host only</li>
+    <li><code>*</code>: every site</li>
+    <li><code>!docs.example.com</code>: an exception, never listed (with its subdomains; <code>!=host</code> for one exact host).
+      Exceptions beat every other rule.</li>
+  </ul>
+  <p class="hint"><code>*</code> plus exceptions is an allowlist: new tabs are blocked everywhere except on the
+    sites you except. Adding a site takes effect at once; reload open tabs after removing one.</p>
   <button id="add-current" hidden></button>
   <textarea id="list" spellcheck="false" placeholder="example.com"></textarea>
   <button id="save">Save</button><span id="saved"></span>
+  <div id="error" role="alert"></div>
   <script type="module" src="options.js"></script>
 </body>
 </html>

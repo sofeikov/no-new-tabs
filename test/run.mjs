@@ -41,6 +41,12 @@ console.log = (...a) => {
 
 function findChrome() {
   if (process.env.CHROME) return process.env.CHROME;
+  // The Chromium build this playwright-core version downloads, on any OS.
+  try {
+    const exe = chromium.executablePath();
+    if (exe && existsSync(exe)) return exe;
+  } catch {}
+  // Older cached builds (Linux layout).
   const base = join(homedir(), ".cache", "ms-playwright");
   const dir = existsSync(base) && readdirSync(base).filter((d) => /^chromium-\d+$/.test(d)).sort().pop();
   const exe = dir && join(base, dir, "chrome-linux64", "chrome");
@@ -1470,6 +1476,276 @@ async function popupChain() {
   report("both windows closed", !r.error && r.survived === 0, `(created ${r.created})`);
 }
 
+// Guard paths earlier tests only reached through a wrapper that happened
+// to work: frames nested in an inserted element (reached through
+// frames[n], never .contentWindow, whose getter adopts on its own),
+// sandbox values the setAttribute and IDL wrappers never see (markup, the
+// parser, a frame already there when the page is armed, other attribute
+// write routes), and arm.js's menu listeners after document mutations.
+// Needs the popup blocker off: the opens are untrusted.
+async function guardInsertions() {
+  console.log("\n=== Inserted subtrees, sandbox writes, menu listeners ===");
+  // 1. Frames nested in an inserted element are adopted before the call
+  // returns. javascript:false frames get no guard copy of their own.
+  await rawLoad(`${LISTED}/index.html`);
+  let r = await rawCase(() => rp.eval(`(() => {
+    const d = document.createElement("div");
+    const f = document.createElement("iframe");
+    f.src = "javascript:false";
+    f.name = "nested-jsf";
+    d.appendChild(f);
+    document.body.appendChild(d);
+    window.__ret = frames["nested-jsf"].open("/target.html?case=nested-insert");
+  })()`, { gesture: true }));
+  report("frame nested in an inserted div", !r.error && r.created === 0 && r.ret === null,
+    `(created ${r.created}, returned ${r.ret})`);
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(() => rp.eval(`(() => {
+    const d = document.createElement("div");
+    const s = document.createElement("section");
+    const deep = document.createElement("iframe");
+    deep.src = "javascript:false";
+    s.appendChild(deep);
+    const near = document.createElement("iframe");
+    near.src = "javascript:false";
+    d.append(s, near);
+    document.body.append(d);
+    const n = window.length;
+    const a = window[n - 2].open("/target.html?case=nested-deep");
+    const b = window[n - 1].open("/target.html?case=nested-near");
+    window.__ret = a === null && b === null ? null : a ?? b;
+  })()`, { gesture: true }));
+  report("two frames at two depths in one insert", !r.error && r.created === 0 && r.ret === null,
+    `(created ${r.created}, returned ${r.ret})`);
+
+  // 2. allow-popups on an opaque frame is stripped however the value got
+  // there. Markup insertion: no setAttribute or IDL setter runs.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      document.addEventListener("load", (e) => { if (e.target.id === "h-opaque2") window.__opaque2 = true; }, true);
+      document.body.insertAdjacentHTML("beforeend",
+        '<iframe id="h-opaque2" sandbox="allow-popups allow-forms" src="/opaque.html"></iframe>');
+    })()`);
+    await poll(() => rp.eval(`window.__opaque2 === true`).catch(() => false), 4000);
+    await rp.clickIn("#h-opaque2", "a");
+  });
+  let sbx = await rp.eval(`document.getElementById("h-opaque2").getAttribute("sandbox")`).catch(() => "?");
+  report("markup-inserted opaque sandbox _blank click", !r.error && r.created === 0 && sbx === "allow-forms",
+    `(created ${r.created}, sandbox "${sbx}")`);
+  // Parser-inserted (a fixture page): only the observer and the load
+  // listener see this frame.
+  await rawLoad(`${LISTED}/sandboxparse.html`);
+  // The parser commits this frame's first document before any script can
+  // strip allow-popups, so the guard can only re-navigate it afterwards; a
+  // click that lands before that load may still open a tab (a flash).
+  // What is guaranteed: the attribute is stripped, and the background
+  // closes whatever opens. "created" is reported for information.
+  await poll(() => rp.eval(`window.__renavAt !== undefined && window.__pLoad > window.__renavAt`).catch(() => false), 4000);
+  sbx = await rp.eval(`document.getElementById("p-opaque").getAttribute("sandbox")`).catch(() => "?");
+  r = await rawCase(() => rp.clickIn("#p-opaque", "a"));
+  report("parser-inserted opaque sandbox _blank click", !r.error && r.survived === 0 && sbx === "allow-forms",
+    `(created ${r.created}, survived ${r.survived}, sandbox "${sbx}")`);
+  // A frame already there when the page is armed. The browser applies a
+  // sandbox change only on the frame's next navigation, so the guard
+  // navigates the frame again when it strips; wait for that load.
+  await rawLoad(`${UNLISTED}/sandboxparse.html`);
+  await rp.eval(`document.getElementById("p-opaque").addEventListener("load", () => { window.__renav = true; })`);
+  await raw.setDomains(["localhost", "127.0.0.1"]);
+  await poll(() => rp.eval(`window.__noNewTabsGuard?.() === true`).catch(() => false), 3000);
+  await poll(() => rp.eval(`window.__renav === true`).catch(() => false), 4000);
+  sbx = await rp.eval(`document.getElementById("p-opaque").getAttribute("sandbox")`).catch(() => "?");
+  r = await rawCase(() => rp.clickIn("#p-opaque", "a"));
+  await raw.setDomains(["localhost"]);
+  report("opaque sandbox present before arming", !r.error && r.created === 0 && sbx === "allow-forms",
+    `(created ${r.created}, sandbox "${sbx}")`);
+  // ... inside a javascript:false frame, which has no arm.js of its own:
+  // arming must tame every document the guard is installed in.
+  await rawLoad(`${UNLISTED}/index.html`);
+  await rp.eval(`(() => {
+    const outer = document.createElement("iframe");
+    outer.id = "h-sub";
+    outer.src = "javascript:false";
+    document.body.append(outer);
+    const doc = outer.contentDocument;
+    doc.body.innerHTML = '<iframe sandbox="allow-popups allow-forms" src="' + location.origin + '/opaque.html?sub"></iframe>';
+    doc.querySelector("iframe").addEventListener("load", () => { window.__subLoaded = true; });
+  })()`);
+  // Loaded before arming, so the load listener cannot be what strips it.
+  await poll(() => rp.eval(`window.__subLoaded === true`).catch(() => false), 4000);
+  await raw.setDomains(["localhost", "127.0.0.1"]);
+  await poll(() => rp.eval(`window.__noNewTabsGuard?.() === true`).catch(() => false), 3000);
+  sbx = await rp.eval(`document.getElementById("h-sub").contentDocument.querySelector("iframe").getAttribute("sandbox")`).catch(() => "?");
+  await raw.setDomains(["localhost"]);
+  report("opaque sandbox in a subdocument before arming", sbx === "allow-forms", `(sandbox "${sbx}")`);
+  // Escalation after insertion, through each attribute write route the
+  // guard hooks. The value the browser stored is what counts.
+  await rawLoad(`${LISTED}/index.html`);
+  await rp.eval(`(() => {
+    const f = document.createElement("iframe");
+    f.id = "h-esc";
+    f.setAttribute("sandbox", "allow-forms");
+    f.src = "/opaque.html";
+    f.addEventListener("load", () => { window.__esc = (window.__esc ?? 0) + 1; });
+    document.body.append(f);
+  })()`);
+  await poll(() => rp.eval(`window.__esc >= 1`).catch(() => false), 4000);
+  const routes = [
+    ["setAttribute", `f.setAttribute("sandbox", v)`],
+    ["setAttribute, two-faced name", `let n = 0; f.setAttribute({ toString() { return n++ ? "sandbox" : "x"; } }, v)`],
+    ["setAttributeNS", `f.setAttributeNS(null, "sandbox", v)`],
+    ["setAttributeNode", `const a = document.createAttribute("sandbox"); a.value = v; f.setAttributeNode(a)`],
+    ["setAttributeNodeNS", `const a = document.createAttributeNS(null, "sandbox"); a.value = v; f.setAttributeNodeNS(a)`],
+    ["attributes.setNamedItem", `const a = document.createAttribute("sandbox"); a.value = v; f.attributes.setNamedItem(a)`],
+    ["attributes.setNamedItemNS", `const a = document.createAttributeNS(null, "sandbox"); a.value = v; f.attributes.setNamedItemNS(a)`],
+    // allow-scripts keeps allow-popups; removing it leaves an opaque frame with popups.
+    ["sandbox.remove", `f.setAttribute("sandbox", "allow-scripts " + v); f.sandbox.remove("allow-scripts")`],
+    ["sandbox.add", `f.sandbox.add("allow-popups")`],
+    ["sandbox.toggle", `f.sandbox.toggle("allow-popups")`],
+    ["sandbox.replace", `f.sandbox.replace("allow-forms", "allow-popups"); f.sandbox.add("allow-forms")`],
+    ["sandbox.value", `f.sandbox.value = v`],
+    ["Attr value", `f.getAttributeNode("sandbox").value = v`],
+    ["Attr nodeValue", `f.getAttributeNode("sandbox").nodeValue = v`],
+    ["Attr textContent", `f.getAttributeNode("sandbox").textContent = v`],
+  ];
+  for (const [name, code] of routes) {
+    const v = await rp.eval(`(() => {
+      const f = document.getElementById("h-esc");
+      f.setAttribute("sandbox", "allow-forms");
+      const v = "allow-popups allow-forms";
+      ${code};
+      return f.getAttribute("sandbox");
+    })()`).catch((e) => `error ${e.message}`);
+    report(`escalation via ${name} stripped`, v === "allow-forms", `(sandbox "${v}")`);
+  }
+  // And the click after a re-navigation, for the route the old wrapper
+  // read differently from the browser.
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      const f = document.getElementById("h-esc");
+      let n = 0;
+      f.setAttribute({ toString() { return n++ ? "sandbox" : "x"; } }, "allow-popups allow-forms");
+      f.src = "/opaque.html?escalated";
+    })()`);
+    await poll(() => rp.eval(`window.__esc >= 2`).catch(() => false), 4000);
+    await rp.clickIn("#h-esc", "a");
+  });
+  report("two-faced setAttribute escalation _blank click", !r.error && r.created === 0, `(created ${r.created})`);
+  // A customized built-in iframe runs page code (attributeChangedCallback)
+  // after the browser stored the value and before the guard's wrapper
+  // regains control: it starts a navigation with allow-popups in effect.
+  await rawLoad(`${LISTED}/index.html`);
+  r = await rawCase(async () => {
+    await rp.eval(`(() => {
+      customElements.define("x-esc-frame", class extends HTMLIFrameElement {
+        static get observedAttributes() { return ["sandbox"]; }
+        attributeChangedCallback(k, old, now) {
+          if (now && now.includes("allow-popups")) this.src = "/opaque.html?ce";
+        }
+      }, { extends: "iframe" });
+      const f = document.createElement("iframe", { is: "x-esc-frame" });
+      f.id = "h-ce";
+      f.addEventListener("load", () => { window.__ce = (window.__ce ?? 0) + 1; });
+      document.body.append(f);
+      f.setAttributeNS(null, "sandbox", "allow-popups allow-forms");
+    })()`);
+    // The initial about:blank fires one load on insertion; /opaque.html the next.
+    await poll(() => rp.eval(`window.__ce >= 2`).catch(() => false), 4000);
+    await sleep(300); // any second load lands by now
+    await rp.clickIn("#h-ce", "a");
+  });
+  report("escalation, page code between write and strip", !r.error && r.created === 0, `(created ${r.created})`);
+
+  // 3. arm.js re-runs its menu setup on every document-level mutation (so
+  // it survives document.open()). Duplicate contextmenu listeners would
+  // use up the gesture-time selection in the first copy and report the
+  // page's planted selection from the second (issue 6 part A again).
+  const record = () => raw.swEval(`chrome.storage.session.get("menus").then((s) => Object.values(s.menus ?? {})[0] ?? null)`);
+  await rawLoad(`${LISTED}/index.html`);
+  await raw.swEval(`(() => {
+    self.__menuMsgs = 0;
+    if (!self.__menuCounter) {
+      self.__menuCounter = (m) => { if (m?.type === "contextMenu") self.__menuMsgs++; };
+      chrome.runtime.onMessage.addListener(self.__menuCounter);
+    }
+    return true;
+  })()`);
+  await rp.eval(`for (let i = 0; i < 3; i++) document.appendChild(document.createComment("x"))`);
+  await sleep(50); // the observer runs a microtask later
+  await rp.eval(`document.appendChild(document.createComment("y"))`);
+  await sleep(50);
+  await rp.eval(`window.addEventListener("mousedown", () => {
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById("menu-attack"));
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+  }, true)`);
+  const clicked = Date.now();
+  await rp.click("#menu-attack", { button: "right" });
+  await awaitMenuRecord(record, clicked);
+  await sleep(300); // a duplicate report would land by now
+  const msgs = await raw.swEval(`self.__menuMsgs`).catch(() => -1);
+  const sel = (await record())?.selection;
+  report("gesture-time selection dropped after mutations", sel === "", `(selection ${JSON.stringify(sel)})`);
+  report("one menu report per menu after mutations", msgs === 1, `(reports ${msgs})`);
+
+  // 4. The attribute-write wrappers added for (2) look native while armed
+  // and are gone again on an unlisted page.
+  const nativeCheck = `(() => {
+    const native = (f) => typeof f === "function" && Function.prototype.toString.call(f).includes("[native code]") &&
+      !Object.hasOwn(f, "prototype");
+    const d = (o, k) => Object.getOwnPropertyDescriptor(o.prototype, k);
+    return [Element.prototype.setAttribute, Element.prototype.setAttributeNS, Element.prototype.setAttributeNode,
+      Element.prototype.setAttributeNodeNS, Element.prototype.toggleAttribute, NamedNodeMap.prototype.setNamedItem,
+      NamedNodeMap.prototype.setNamedItemNS, DOMTokenList.prototype.add, DOMTokenList.prototype.remove,
+      DOMTokenList.prototype.toggle, DOMTokenList.prototype.replace, d(DOMTokenList, "value").set, d(HTMLIFrameElement, "sandbox").get,
+      d(HTMLIFrameElement, "sandbox").set, d(Attr, "value").set, d(Node, "nodeValue").set, d(Node, "textContent").set,
+    ].every(native);
+  })()`;
+  // A wrapper shows up in the stack of the error a bad call throws.
+  const inStack = `(() => {
+    try { Object.getOwnPropertyDescriptor(Node.prototype, "textContent").set.call(1, "x"); }
+    catch (e) { return /chrome-extension:/.test(e.stack); }
+    return null;
+  })()`;
+  await rawLoad(`${LISTED}/index.html`);
+  report("attribute-write wrappers look native when armed",
+    await rp.eval(inStack) === true && await rp.eval(nativeCheck) === true);
+  await rawLoad(`${UNLISTED}/index.html`);
+  await poll(() => rp.eval(`window.__noNewTabsGuard === undefined`).catch(() => false));
+  report("attribute-write wrappers removed when unlisted",
+    await rp.eval(inStack) === false && await rp.eval(nativeCheck) === true);
+}
+
+// Rule grammar end to end: "*" lists every site and "!a.test" excepts
+// a.test with its subdomains, so new tabs are blocked everywhere but there
+// (an allowlist). arm.js and the background read the same match.js.
+async function ruleGrammar() {
+  console.log("\n=== Rule grammar: * plus an exception (allowlist) ===");
+  const before = await getDomains();
+  await setDomains(["*", "!a.test"]);
+  try {
+    const listed = `http://b.test:${PORT}/index.html`;
+    await loadStart(listed);
+    report("b.test (via *): guard armed", await page.evaluate(() => window.__noNewTabsGuard?.() === true));
+    const r = await openCase(listed, (d) => d.click("#btn-open"));
+    report("b.test (via *): window.open blocked", r.created === 0 && r.survived === 0 && r.ret === null,
+      `(created ${r.created}, returned ${r.ret === null ? "null" : typeof r.ret})`);
+    for (const host of ["a.test", "x.a.test"]) {
+      const url = `http://${host}:${PORT}/index.html`;
+      await page.goto(url, { waitUntil: "load" });
+      await pollPage(page, () => page.evaluate(() => window.__noNewTabsGuard === undefined).catch(() => false));
+      report(`${host} (excepted): guard removed`, await page.evaluate(() =>
+        "value" in Object.getOwnPropertyDescriptor(window, "open") && !("__noNewTabsGuard" in window)));
+      const r2 = await openCase(url, (d) => d.click("#btn-open"));
+      report(`${host} (excepted): window.open works`, r2.survived === 1 && r2.ret !== null && r2.ret !== undefined,
+        `(created ${r2.created}, left ${r2.survived})`);
+    }
+  } finally {
+    await setDomains(before ?? ["localhost"]);
+  }
+}
+
 // --- Orchestration: sharded, filterable, lazily launched -------------------
 // Each step names the browser it needs. With TEST_ONLY unset every step runs
 // in the historical order, which this table preserves exactly. TEST_ONLY is a
@@ -1506,6 +1782,8 @@ const STEPS = [
   { id: "reloadEdge", setup: "rawBg", run: reloadEdge },
   { id: "menuKept", setup: "rawBg", run: menuKept },
   { id: "popupChain", setup: "rawBgNoPopup", run: popupChain },
+  { id: "guardInsertions", setup: "rawExtNoPopup", run: guardInsertions },
+  { id: "ruleGrammar", setup: "pw", run: ruleGrammar },
 ];
 const GROUP_HEADER = {
   rawExt: "Full extension, raw CDP",
@@ -1528,6 +1806,14 @@ async function ensureSetup(which) {
   } else {
     await launchRawBrowser(EXT);
   }
+}
+
+// parallel.mjs reads the step table from here instead of keeping its own
+// copy of the count: LIST_STEPS=1 prints it as JSON and exits.
+if (process.env.LIST_STEPS) {
+  rawLog(JSON.stringify(STEPS.map((s, index) => ({ index, id: s.id, setup: s.setup }))));
+  server.close();
+  process.exit(0);
 }
 
 try {

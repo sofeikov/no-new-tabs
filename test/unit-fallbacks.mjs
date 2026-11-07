@@ -4,10 +4,14 @@
 // event is judged at, and a re-commit after a back/forward restore.
 //
 // Same harness as the pruning tests: the shipped background.js with a
-// fake chrome API, controlled webNavigation timestamps, no browser.
+// fake chrome API, controlled webNavigation timestamps, a virtual clock,
+// no browser. Each close is also pinned to the decision path it documents
+// (bg.why), so a mutant that still closes the tab, but for another
+// reason, fails.
 //
 //   node --test test/unit-fallbacks.mjs
-//   BG_PRUNE_PATH=/tmp/mutant-bg2.js node --test test/unit-fallbacks.mjs
+//   BG_PATH=/tmp/mut/background.js node --test test/unit-fallbacks.mjs
+//   (copy extension/lib.js and extension/match.js next to the mutant)
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -20,11 +24,14 @@ const UNLISTED = "http://127.0.0.1:8888/index.html";
 const frame0 = (url) => ({ frameId: 0, parentFrameId: -1, url });
 
 // A popup with no address of its own (window.open from script). With no
-// navigation source the background judges the opener's top page.
+// navigation source the background judges the opener's top page. Returns
+// "closed" or "kept".
 async function popupNoSource(bg, id) {
   bg.fireCreated({ id, openerTabId: TAB });
   await bg.settle();
-  return bg.removedTabs().includes(id) ? undefined : id;
+  const verdict = bg.verdict(id);
+  if (verdict === "closed") assert.match(bg.why(id), /no navigation source/, "closed by the no-source fallback");
+  return verdict;
 }
 
 describe("background fallbacks (issue 15)", () => {
@@ -40,6 +47,9 @@ describe("background fallbacks (issue 15)", () => {
     bg.fireNavTarget({ tabId: 9, sourceTabId: TAB, sourceFrameId: 99, url: LISTED_TARGET, timeStamp: Date.now() });
     await bg.settle();
     assert.deepEqual(bg.removedTabs(), [9], "popup from a vanished listed frame is closed");
+    // Through the navigation source (frame 99 -> top frame), not the
+    // no-source fallback that would also close it.
+    assert.match(bg.why(9), /^opened by tab 1: http/);
   });
 
   it("tabs open before the worker started are judged from the first commit on", async () => {
@@ -50,13 +60,13 @@ describe("background fallbacks (issue 15)", () => {
     });
     // Moments before the first top commit are unknown: taken as listed,
     // even though the tab shows an unlisted page.
-    assert.equal(await popupNoSource(bg, 9), undefined, "popup before the first commit is closed");
+    assert.equal(await popupNoSource(bg, 9), "closed", "popup before the first commit is closed");
     // The first commit ends the unknown window: judged normally after.
     const now = Date.now();
     bg.fireCommitted({ tabId: TAB, frameId: 0, url: UNLISTED, timeStamp: now, transitionType: "link" });
-    assert.equal(await popupNoSource(bg, 10), 10, "popup on the unlisted page is kept");
+    assert.equal(await popupNoSource(bg, 10), "kept", "popup on the unlisted page is kept");
     bg.fireCommitted({ tabId: TAB, frameId: 0, url: LISTED, timeStamp: now, transitionType: "link" });
-    assert.equal(await popupNoSource(bg, 11), undefined, "popup after navigating to the listed site is closed");
+    assert.equal(await popupNoSource(bg, 11), "closed", "popup after navigating to the listed site is closed");
   });
 
   it("a late navigation event is judged at the creation moment", async () => {
@@ -78,6 +88,7 @@ describe("background fallbacks (issue 15)", () => {
     // though the first decision (no commit ever comes) would keep it.
     await bg.settle(4500);
     assert.deepEqual(bg.removedTabs(), [9], "late navigation event still closes the popup");
+    assert.match(bg.why(9), /^opened by tab 1: http/, "closed by the re-decision with the navigation source");
   });
 
   it("a back/forward re-commit records live subframes for the no-source fallback", async () => {
@@ -92,6 +103,6 @@ describe("background fallbacks (issue 15)", () => {
     // The frame is gone again by the time the popup opens, but its rows
     // say it was listed.
     frames[TAB] = [frame0(UNLISTED)];
-    assert.equal(await popupNoSource(bg, 9), undefined, "popup is judged by the restored listed frame");
+    assert.equal(await popupNoSource(bg, 9), "closed", "popup is judged by the restored listed frame");
   });
 });

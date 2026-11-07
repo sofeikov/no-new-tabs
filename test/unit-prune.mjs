@@ -5,10 +5,11 @@
 // survive: an unlisted top page, a listed iframe loaded 65 s ago, a cold
 // worker, and the top page sent away. These tests drive the SHIPPED
 // background.js through a fake chrome API with controlled webNavigation
-// timestamps — no browser, each scenario under a second.
+// timestamps and a virtual clock — no browser, no real waits.
 //
 //   node --test test/unit-prune.mjs
-//   BG_PRUNE_PATH=/tmp/mutant-bg.js node --test test/unit-prune.mjs
+//   BG_PATH=/tmp/mut/background.js node --test test/unit-prune.mjs
+//   (copy extension/lib.js and extension/match.js next to the mutant)
 //
 // The mutant these discriminate (applied to a /tmp copy, never committed):
 // in the top-commit loop, `if (e.left == null) e.left = ...; else if
@@ -38,12 +39,16 @@ const iframeRows = (sessionData) => (sessionData[`h.${TAB}`]?.rows ?? []).filter
 
 // A popup from the iframe, with the navigation source naming the frame
 // (window.open from a listed frame on an unlisted page). Returns the
-// background's verdict: the popup tab id when kept, undefined when closed.
+// background's verdict, "closed" or "kept"; a close must come from the
+// navigation-source path (the top page is unlisted, so the no-source
+// fallback would keep it).
 async function popupFromIframe(bg, timeStamp) {
   bg.fireCreated({ id: 9, openerTabId: TAB });
   bg.fireNavTarget({ tabId: 9, sourceTabId: TAB, sourceFrameId: IFRAME, url: LISTED_TARGET, timeStamp });
   await bg.settle();
-  return bg.removedTabs().includes(9) ? undefined : 9;
+  const verdict = bg.verdict(9);
+  if (verdict === "closed") assert.match(bg.why(9), /^opened by tab 1: http/, "closed through the navigation source");
+  return verdict;
 }
 
 describe("pruning 60 s after a frame leaves (issue 15)", () => {
@@ -59,7 +64,7 @@ describe("pruning 60 s after a frame leaves (issue 15)", () => {
     const rows = iframeRows(bg.sessionData());
     assert.equal(rows.length, 1, `iframe rows kept, got ${JSON.stringify(rows)}`);
     assert.equal(rows[0][2], "localhost");
-    assert.equal(await popupFromIframe(bg, Date.now()), undefined, "popup from the listed iframe is closed");
+    assert.equal(await popupFromIframe(bg, Date.now()), "closed", "popup from the listed iframe is closed");
   });
 
   it("leaving stamps rows, and 61 s later they are gone", async () => {
@@ -71,7 +76,7 @@ describe("pruning 60 s after a frame leaves (issue 15)", () => {
     bg.fireCommitted({ tabId: TAB, frameId: 0, url: UNLISTED_OTHER, timeStamp: left, transitionType: "link" });
     // Between leaving and the 60 s mark the popup is still judged by what
     // the frame was.
-    assert.equal(await popupFromIframe(bg, left), undefined, "popup right after the frame leaves is closed");
+    assert.equal(await popupFromIframe(bg, left), "closed", "popup right after the frame leaves is closed");
     // 61 s after leaving, a new top commit splices the rows. It goes to a
     // different host so the commit itself is recorded (a same-host commit
     // changes nothing and schedules no save of its own).
@@ -89,7 +94,7 @@ describe("pruning 60 s after a frame leaves (issue 15)", () => {
     });
     await bg.settle(700);
     assert.equal(iframeRows(bg.sessionData()).length, 1, "restored iframe rows kept");
-    assert.equal(await popupFromIframe(bg, Date.now()), undefined, "popup from the restored listed iframe is closed");
+    assert.equal(await popupFromIframe(bg, Date.now()), "closed", "popup from the restored listed iframe is closed");
   });
 
   it("pruneDead drops only old rows of gone frames", async () => {

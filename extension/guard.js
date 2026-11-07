@@ -38,7 +38,6 @@
   // f(self, ...args) without going through anything the page can replace.
   const uncurry = (f) => (self, ...args) => apply(f, self, args);
   const getter = (proto, key) => uncurry(ownDesc(proto, key).get);
-  const fnToString = uncurry(Function.prototype.toString);
   const toLower = uncurry(String.prototype.toLowerCase);
   const charAt = uncurry(String.prototype.charCodeAt);
   const strSlice = uncurry(String.prototype.slice);
@@ -72,7 +71,10 @@
   const hasAttr = uncurry(Element.prototype.hasAttribute);
   const hasAttrNS = uncurry(Element.prototype.hasAttributeNS);
   const matches = uncurry(Element.prototype.matches);
+  // querySelector is only an existence test ("any frame in here?"): it is
+  // cheap when the answer is no, which it is for most inserted subtrees.
   const elQuery = uncurry(Element.prototype.querySelector);
+  const elQueryAll = uncurry(Element.prototype.querySelectorAll);
   const docQuery = uncurry(Document.prototype.querySelector);
   const docQueryAll = uncurry(Document.prototype.querySelectorAll);
   const setAttr = uncurry(Element.prototype.setAttribute);
@@ -102,6 +104,13 @@
   const baseURI = getter(Node.prototype, "baseURI");
   const URLC = URL;
   const iframeWindow = getter(HTMLIFrameElement.prototype, "contentWindow");
+  // <frame> and <object> have native getters of their own. Read through
+  // these, never el.contentWindow: a page can hide the adopting getter
+  // behind an own property on the element.
+  let frameWindow = null, objectWindow = null, attrOwner = null;
+  try { frameWindow = getter(HTMLFrameElement.prototype, "contentWindow"); } catch {}
+  try { objectWindow = getter(HTMLObjectElement.prototype, "contentWindow"); } catch {}
+  try { attrOwner = getter(Attr.prototype, "ownerElement"); } catch {}
   const [winName, winLength, winOrigin, winFrameElement, winTop] =
     ["name", "length", "origin", "frameElement", "top"].map((k) => getter(window, k));
   const setTimer = setTimeout.bind(window);
@@ -119,6 +128,7 @@
   // removed: arm.js found the page unlisted and the guard took itself out.
   const state = { armed: false, removed: false };
   const nativeOf = new WeakMap(); // wrapper -> the function it stands in for
+  const sandboxLists = new WeakMap(); // an iframe's sandbox DOMTokenList -> the iframe
   const listenedRoots = new WeakSet(); // shadow roots with our listeners
 
   let logged = 0;
@@ -178,7 +188,10 @@
     install(window); // in case it was removed as unlisted
     forEachRecord((rec) => rec.lock());
     sweep(window);
+    // Every document the guard is installed in, not just this one: an
+    // adopted javascript: frame has no arm.js to arm its own copy.
     tameDocument(document);
+    forEachRecord((rec) => { try { tameDocument(rec.win.document); } catch {} });
   }
 
   // --- Where does a target name lead? ---------------------------------------
@@ -279,7 +292,11 @@
   }
 
   const viewOf = (node) => { try { return defaultView(ownerDocument(node)); } catch { return null; } };
-  const isElement = (n) => { try { return nodeType(n) === 1; } catch { return false; } };
+  // A primitive is never a Node: no getter call (and no exception) for it.
+  const isElement = (n) => {
+    if (n === null || (typeof n !== "object" && typeof n !== "function")) return false;
+    try { return nodeType(n) === 1; } catch { return false; }
+  };
   const baseTarget = (doc) => {
     const base = doc && docQuery(doc, "base[target]");
     return (base && getAttr(base, "target")) ?? "";
@@ -322,6 +339,18 @@
   const formUrl = (form) => resolveUrl(form, getAttr(form, "action"));
 
   // --- Child frames ---------------------------------------------------------
+
+  // The window of a frame element, through the saved native getter for its
+  // tag. <embed> (and anything else) has none: null.
+  const childWindow = (el) => {
+    try {
+      const tag = localName(el);
+      if (tag === "iframe") return iframeWindow(el);
+      if (tag === "frame") return frameWindow ? frameWindow(el) : null;
+      if (tag === "object") return objectWindow ? objectWindow(el) : null;
+    } catch {}
+    return null;
+  };
 
   // Guard a same-origin child window (and its children). Cross-origin ones
   // throw on access and get their own copy of guard.js from the browser.
@@ -380,12 +409,28 @@
     eachToken(s, (cur) => { if (toLower(cur) !== "allow-popups") out += (out === "" ? "" : " ") + cur; });
     return out;
   };
+  // The browser takes a frame's sandbox flags when a navigation starts (for
+  // the first document: when the frame is inserted), and a later change
+  // applies only to the next one. So once allow-popups has been stored on
+  // a frame in the document, stripping the attribute is not enough: the
+  // document already loading (or loaded) keeps it. Navigate the frame
+  // again to what its attributes say, so the stripped flags take effect.
+  // This only happens when something was actually stripped, which a
+  // script-less opaque frame asking for popups is: a rare, extra load.
+  const renavigate = (el) => {
+    if (!isConnected(el)) return;
+    if (hasAttr(el, "srcdoc")) setAttr(el, "srcdoc", getAttr(el, "srcdoc"));
+    else if (hasAttr(el, "src")) setAttr(el, "src", getAttr(el, "src"));
+  };
   const tameSandbox = (el) => {
     try {
       const v = getAttr(el, "sandbox");
       if (v == null) return;
       const stripped = stripPopups(v);
-      if (stripped !== v) apply(setAttr, el, ["sandbox", stripped]);
+      if (stripped === v) return;
+      // setAttr is already uncurried: the element is its first argument.
+      setAttr(el, "sandbox", stripped);
+      renavigate(el);
     } catch {}
   };
   const tameDocument = (doc) => {
@@ -674,69 +719,140 @@
     });
 
     // Post-insertion sandbox escalation: strip allow-popups the same way
-    // no matter how it is set, and tame the IDL setter too (it reflects to
-    // the attribute without going through setAttribute).
+    // no matter how it is set. Every attribute write route re-tames the
+    // iframe after the write, from the value the browser actually stored,
+    // so no argument trick (a name object whose toString answers "x" to
+    // the guard and "sandbox" to the browser, a namespace, an Attr node)
+    // can split the guard's view from the browser's.
+    const tameAfter = (el) => {
+      if (!state.armed) return;
+      try { if (localName(el) === "iframe") tameSandbox(el); } catch {}
+    };
     method(win.Element.prototype, "setAttribute", (native) => ({
-      setAttribute() {
-        if (state.armed && arguments.length >= 2 && isElement(this)) {
-          let k = "";
-          try { k = toLower(`${arguments[0]}`); } catch {}
-          if (k === "sandbox" && localName(this) === "iframe") {
-            try { arguments[1] = stripPopups(`${arguments[1] ?? ""}`); } catch {}
-          }
+      setAttribute(name, value) {
+        // A plain string name is also checked up front, so the browser
+        // never stores allow-popups at all on the common route.
+        if (state.armed && arguments.length >= 2 && typeof name === "string" && name.length === 7 &&
+            toLower(name) === "sandbox" && isElement(this) && localName(this) === "iframe") {
+          try { arguments[1] = stripPopups(`${value ?? ""}`); } catch {}
         }
-        return apply(native, this, arguments);
+        try { return apply(native, this, arguments); } finally { tameAfter(this); }
       },
     }.setAttribute));
-    setter(win.HTMLIFrameElement?.prototype, "sandbox", (native) => function (v) {
-      let value = v;
-      try { if (state.armed) value = stripPopups(value); } catch {}
-      return apply(native, this, [value]);
+    // Wrap methods (or setters) of obj so after(this, args) runs once the
+    // native returns or throws.
+    const methodsThen = (obj, keys, after) => each(keys, (key) => method(obj, key, (native) => ({
+      [key]() {
+        try { return apply(native, this, arguments); } finally { after(this, arguments); }
+      },
+    }[key])));
+    const setterThen = (obj, key, after) => setter(obj, key, (native) => ownDesc({
+      set [key](v) {
+        try { apply(native, this, [v]); } finally { after(this); }
+      },
+    }, key).set);
+    methodsThen(win.Element.prototype, ["setAttributeNS", "setAttributeNode", "setAttributeNodeNS", "toggleAttribute"], tameAfter);
+    // element.attributes.setNamedItem(attr): the element is the Attr's owner.
+    methodsThen(win.NamedNodeMap?.prototype, ["setNamedItem", "setNamedItemNS"], (map, args) => {
+      try { if (attrOwner) tameAfter(attrOwner(args[0])); } catch {}
     });
+    // iframe.sandbox: the IDL setter reflects to the attribute without
+    // going through setAttribute, and converts its value once, here. The
+    // getter hands out the frame's DOMTokenList, which has no way back to
+    // its element: remember the pair, so the list's own writes below can
+    // tame the frame.
+    const iframeProto = win.HTMLIFrameElement?.prototype;
+    const sandboxDesc = iframeProto && ownDesc(iframeProto, "sandbox");
+    if (sandboxDesc?.get && sandboxDesc.set) {
+      const nativeGet = sandboxDesc.get;
+      const nativeSet = sandboxDesc.set;
+      const { get, set } = ownDesc({
+        get sandbox() {
+          const list = apply(nativeGet, this, []);
+          try { wmSet(sandboxLists, list, this); } catch {}
+          return list;
+        },
+        set sandbox(v) {
+          let value = v;
+          try { if (state.armed) value = stripPopups(value); } catch {}
+          apply(nativeSet, this, [value]);
+        },
+      }, "sandbox");
+      patch(iframeProto, "sandbox", null, { ...sandboxDesc, get: wrap(nativeGet, get), set: wrap(nativeSet, set) });
+    }
+    // sandbox.add("allow-popups"), toggle, replace and value. Every other
+    // list (classList and the like) pays one WeakMap lookup per call.
+    const tameList = (list) => {
+      if (!state.armed) return;
+      const el = wmGet(sandboxLists, list);
+      if (el !== undefined) tameAfter(el);
+    };
+    methodsThen(win.DOMTokenList?.prototype, ["add", "remove", "toggle", "replace"], tameList);
+    setterThen(win.DOMTokenList?.prototype, "value", tameList);
+    // The sandbox attribute's own Attr node: value, nodeValue, textContent.
+    // nodeValue and textContent live on Node, so every other node pays one
+    // nodeType read.
+    const tameAttr = (node) => {
+      if (!state.armed || !attrOwner) return;
+      try { if (nodeType(node) === 2) tameAfter(attrOwner(node)); } catch {}
+    };
+    setterThen(win.Attr?.prototype, "value", tameAttr);
+    setterThen(win.Node?.prototype, "nodeValue", tameAttr);
+    setterThen(win.Node?.prototype, "textContent", tameAttr);
 
     // Any insertion that adds a frame to a window: adopt the new frames
     // before the call returns.
     const FRAME_SELECTOR = "iframe, frame, object, embed";
-    const childWindow = (el) => {
-      try { return iframeWindow(el); } catch { try { return el.contentWindow; } catch { return null; } }
-    };
-    // Adopt only what this call could have added: the inserted nodes
-    // themselves, wherever they landed. String HTML (innerHTML and
-    // friends) can land anywhere, so only a sweep is sure to find those
-    // frames.
+    // Adopt (and, when armed, tame) only what this call could have added:
+    // the inserted elements and every frame inside them, wherever they
+    // landed. String HTML (innerHTML and friends) and fragments can land
+    // anywhere, so only a sweep is sure to find those frames. So is a
+    // frame count that grew by more than the frame elements found here
+    // (a frame the call made some other way, say a script it ran).
     const adoptAdded = (view, before, after, args) => {
-      if (!view) return;
       let nodes = false;
+      let found = 0;
+      const take = (el) => {
+        found++;
+        try { if (state.armed && localName(el) === "iframe") tameSandbox(el); } catch {}
+        try { adopt(childWindow(el)); } catch {}
+      };
       for (let i = 0; i < args.length; i++) {
         const a = args[i];
         if (!isElement(a)) continue;
         nodes = true;
-        try { if (matches(a, FRAME_SELECTOR)) adopt(childWindow(a)); } catch {}
+        try { if (matches(a, FRAME_SELECTOR)) take(a); } catch {}
         let nl = null;
-        try { nl = elQuery(a, FRAME_SELECTOR); } catch {}
-        if (nl) eachNode(nl, (el) => { try { adopt(childWindow(el)); } catch {} });
+        try { if (elQuery(a, FRAME_SELECTOR)) nl = elQueryAll(a, FRAME_SELECTOR); } catch {}
+        eachNode(nl, take);
       }
-      if (!nodes && after > before) sweep(view);
+      if (view && after > before && (!nodes || after - before > found)) {
+        sweep(view);
+        // Frames that came in as markup: tame them now, not a microtask later.
+        if (state.armed) { try { tameDocument(view.document); } catch {} }
+      }
     };
     // A page can shadow startContainer on Node.prototype, so only trust
     // each realm's own Range getter, and only on a real Range of that realm.
+    // Only the Range wrappers ask it: on every other insertion `this` is a
+    // node, and the getter would throw on each call.
     let rangeStart = null;
     try { rangeStart = getter(win.Range.prototype, "startContainer"); } catch {}
-    const viewOfTarget = (self) => {
+    const viewOfTarget = (self, isRange) => {
       try {
         let node = self;
-        if (rangeStart) { try { node = rangeStart(self) ?? self; } catch { node = self; } }
+        if (isRange && rangeStart) { try { node = rangeStart(self) ?? self; } catch { node = self; } }
         return nodeType(node) === 9 ? defaultView(node) : viewOf(node);
       } catch { return null; }
     };
-    const framesAfter = (native, key) => ({
+    const framesAfter = (native, key, isRange = false) => ({
       [key]() {
         // Unlisted and removed: a plain call-through, so wrappers a page
         // script saved earlier cost nothing and run no extension code. (A
         // page that is merely not yet armed keeps adoption below: it could
         // otherwise save a frame's native window.open before arming.)
         if (state.removed) return apply(native, this, arguments);
-        const view = viewOfTarget(this);
+        const view = viewOfTarget(this, isRange);
         let before = -1;
         try { before = view ? winLength(view) : -1; } catch {}
         try {
@@ -744,13 +860,9 @@
         } finally {
           let after = before;
           try { after = view ? winLength(view) : -1; } catch {}
+          // Script-inserted iframes are tamed in there too; parser-inserted
+          // ones are caught by the observer below.
           adoptAdded(view, before, after, arguments);
-          // Tame script-inserted iframes at once; parser-inserted ones are
-          // caught by the observer below, which sees the same count change.
-          if (state.armed) for (let i = 0; i < arguments.length; i++) {
-            const a = arguments[i];
-            if (isElement(a) && matches(a, "iframe")) tameSandbox(a);
-          }
         }
       },
     })[key];
@@ -762,9 +874,10 @@
       [win.DocumentType?.prototype, ["before", "after", "replaceWith"]],
       [win.Document?.prototype, ["append", "prepend", "replaceChildren"]],
       [win.ShadowRoot?.prototype, ["setHTMLUnsafe"]],
-      [win.Range?.prototype, ["insertNode", "surroundContents"]],
+      [win.Range?.prototype, ["insertNode", "surroundContents"], true],
     ];
-    each(insertions, (pair) => each(pair[1], (key) => method(pair[0], key, framesAfter)));
+    each(insertions, (row) => each(row[1], (key) =>
+      method(row[0], key, (native) => framesAfter(native, key, row[2] === true))));
     each([win.Element?.prototype, win.ShadowRoot?.prototype], (proto) =>
       each(["innerHTML", "outerHTML"], (key) => setter(proto, key, framesAfter)));
     const sweepFrom = (doc) => { try { sweep(defaultView(doc)); } catch {} };
@@ -787,9 +900,7 @@
         const el = evTarget(e);
         if (!isElement(el) || !matches(el, FRAME_SELECTOR)) return;
         if (matches(el, "iframe")) tameSandbox(el);
-        let child = null;
-        try { child = iframeWindow(el); } catch { child = el.contentWindow; } // <frame>, <object>
-        adopt(child);
+        adopt(childWindow(el));
       } catch {}
     });
 

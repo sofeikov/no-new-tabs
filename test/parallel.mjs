@@ -9,13 +9,19 @@
 // Each worker gets TEST_ONLY=<index:id,...> and PORT=<base+shard>. The
 // parent streams worker output prefixed with the shard number and exits
 // nonzero if any shard fails.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { cpus } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const STEP_COUNT = 31;
+// The step table lives in run.mjs alone: ask it (on a throwaway port).
+const listed = spawnSync(process.execPath, [join(here, "run.mjs")], {
+  env: { ...process.env, LIST_STEPS: "1", PORT: "0" }, encoding: "utf8",
+});
+const STEPS = JSON.parse(listed.stdout.trim().split("\n").pop() || "[]");
+if (!STEPS.length) throw new Error(`could not list steps from run.mjs:\n${listed.stderr}`);
+const STEP_COUNT = STEPS.length;
 const BASE_PORT = Number(process.env.PORT ?? 8799);
 
 // Default partition, tuned from measured per-step times (see profile notes
@@ -27,7 +33,8 @@ const DEFAULT_PARTITION = [
   [9, 15], // raw CDP, full extension (~45 s)
   [16, 19], // raw CDP, full extension, popup blocker off (~30 s)
   [20, 20], // background layer only: blocked-mode run (~110 s)
-  [21, 30], // background layer only: the rest + popup chain (~70 s)
+  [21, 29], // background layer only: the rest + popup chain (~70 s)
+  // Later steps (guardInsertions, ruleGrammar, ...) are appended to the last shard.
 ];
 
 function parsePartition(argv) {
@@ -35,11 +42,22 @@ function parsePartition(argv) {
     return argv.flatMap((a) => a.split(",")).map((r) => {
       const m = /^(\d+)-(\d+)$/.exec(r.trim());
       if (!m) throw new Error(`bad range: ${r} (want first-last)`);
-      return [Number(m[1]), Number(m[2])];
+      const [a, b] = [Number(m[1]), Number(m[2])];
+      // An empty TEST_ONLY would make run.mjs run every step.
+      if (a > b || b >= STEP_COUNT) throw new Error(`bad range: ${r} (steps are 0-${STEP_COUNT - 1})`);
+      return [a, b];
     });
   }
-  const n = Math.max(1, Math.min(STEP_COUNT, Number(process.env.SHARDS ?? 6)));
-  if (n === DEFAULT_PARTITION.length) return DEFAULT_PARTITION;
+  const want = Number(process.env.SHARDS ?? 6);
+  if (!Number.isInteger(want) || want < 1) throw new Error(`SHARDS must be a positive integer, got ${process.env.SHARDS}`);
+  const n = Math.min(STEP_COUNT, want);
+  if (n === DEFAULT_PARTITION.length) {
+    // Steps added since the partition was tuned join the last shard, so
+    // a new step is never silently skipped.
+    const parts = DEFAULT_PARTITION.filter(([a]) => a < STEP_COUNT).map(([a, b]) => [a, Math.min(b, STEP_COUNT - 1)]);
+    parts[parts.length - 1][1] = STEP_COUNT - 1;
+    return parts;
+  }
   // Fall back to contiguous even slices for any other shard count.
   const out = [];
   for (let i = 0; i < n; i++) {

@@ -1,1 +1,18 @@
-node_modules/
+node_modules
+
+# Chrome's "Pack extension" writes these next to extension/; the .pem is
+# the signing private key.
+*.pem
+*.crx
+
+# Logs and test output
+*.log
+npm-debug.log*
+test-results/
+coverage/
+
+# Editor and OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
