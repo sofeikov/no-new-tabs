@@ -2,7 +2,8 @@
 
 A Brave/Chrome extension (Manifest V3). Sites on your list cannot open new
 tabs or windows, by any method. Everything else on those sites, including
-their JavaScript, keeps working.
+their JavaScript, keeps working. The list can also be turned around: block
+every site except the ones you name.
 
 A blocked link or `window.open` simply does nothing: the page stays where it
 is, and the target is not opened in the current tab instead. `window.open`
@@ -12,10 +13,9 @@ This README has two halves. The first half says what the extension does and
 how to install, use and test it. The second half,
 [How it works: every trick](#how-it-works-every-trick), explains each
 technique the code uses, what attack or problem it answers, and why the
-obvious approach does not work. Links such as
-[background.js:237-241](extension/background.js#L237-L241) point at the
-lines that do the work in the code as it is now. If you change the code,
-update the line numbers (or use GitHub permalinks).
+obvious approach does not work. References such as
+[background.js › pageCreated](extension/background.js) name the file and
+the function or constant that does the work; search the file for the name.
 
 ## Contents
 
@@ -107,9 +107,11 @@ There are two layers.
      Adcash) open popups from. Same-site frames are guarded the moment they
      are inserted, before the page can save their `open`. This includes
      frames sandboxed without scripts that stay readable (same-origin
-     or `allow-same-origin`). Opaque ones cannot be adopted; instead
-     `allow-popups` is stripped from their `sandbox` attribute before
-     they navigate, so the click does nothing.
+     or `allow-same-origin`), and frames nested anywhere inside an
+     inserted element. Opaque ones cannot be adopted; instead
+     `allow-popups` is stripped from their `sandbox` attribute, however
+     the page sets it, and the frame is loaded again so the stripped
+     flags apply. The click then does nothing.
    - cancels `target=_blank` links and forms, `<base target=_blank>`,
      `formtarget`, links and forms in shadow DOM, SVG links, and targets a
      page handler changes after the guard has looked.
@@ -140,8 +142,8 @@ There are two layers.
    `window.open` (and three-argument `document.open`) to an `about:` or
    `javascript:` URL is blocked even when it would stay in the tab, because
    ad scripts use `open('about:blank', '_self')` to blank the page
-   ([guard.js:383-389](extension/guard.js#L383-L389),
-   [guard.js:424-429](extension/guard.js#L424-L429)).
+   ([guard.js › blanksPage](extension/guard.js),
+   [guard.js › inertUrl](extension/guard.js)).
 
    Until a page is known to be listed, `window.open` stays a plain
    property, so test tools and scripts that save and restore it work as
@@ -171,32 +173,61 @@ click the reload arrow on the extension's card.
 It needs a recent Chromium-based browser. Content scripts declared with
 `world: "MAIN"` need Chrome 111 or later, and the manifest also uses
 `match_origin_as_fallback`
-([manifest.json:18-42](extension/manifest.json#L18-L42)). The manifest sets
+([manifest.json › content_scripts](extension/manifest.json)). The manifest sets
 no `minimum_chrome_version`, so an older browser may load it without the
 in-page guard working. Optional APIs (`documentPictureInPicture`,
 `setHTMLUnsafe`) are wrapped only if the browser has them
-([guard.js:336-339](extension/guard.js#L336-L339)).
+([guard.js › method](extension/guard.js)).
 
 ## Use it
 
 - **Quickest:** go to the site, click the extension icon, then click
-  **+ Add current domain**. The tab reloads and the icon shows a red
-  **ON** badge on that site. On a listed site the same button reads
-  **Remove … from list**.
+  **+ Add example.com** (the button names the site). The tab reloads and
+  the icon shows a red **ON** badge on that site. The popup always offers
+  the one change that flips the site you are on:
+  - listed by a rule naming this site: **Remove example.com**;
+  - listed by a broader rule (a parent domain, or `*`), or still listed by
+    one after its own rule is gone: **Allow this site (add !example.com)**,
+    with the host exactly as shown (`!www.example.com` on www), and the
+    status line says which rule lists it ("via …");
+  - kept unlisted by an exception: **Remove exception !example.com**, which
+    also adds the site when no other rule would list it;
+  - unlisted: **+ Add example.com**.
 - **List editor:** right-click the icon and choose **Options**. Use the
-  **+ Add current domain** button to add the tab you were just on, or enter
-  one domain per line and click **Save**. `example.com` also covers
-  `www.example.com` and `app.example.com`. Adding a site takes effect at
-  once, even in tabs that are already open. Removing one takes effect after
-  the tab reloads.
-- Entering `www.example.com` lists `example.com`, so it covers every
-  subdomain too ([lib.js:15](extension/lib.js#L15)). IP addresses work
-  (`127.0.0.1`, `[::1]`).
-- The list is stored as one `chrome.storage.sync` item
-  ([lib.js:53-57](extension/lib.js#L53-L57)), so with browser sync on it
-  follows you to other browsers signed in to the same profile. It is limited
-  by Chrome's sync quota per item (8 KB, a few hundred domains); a larger
-  list fails to save, and the options page then shows no "Saved" message.
+  **+ Add current domain** button (the same choice as the popup's, for
+  the tab you were just on), or enter
+  one rule per line and click **Save**. Adding a site takes effect at once,
+  even in tabs that are already open. Removing one takes effect after the
+  tab reloads.
+
+One rule per line (commas work too):
+
+| Rule | Lists |
+| --- | --- |
+| `example.com` | the site and every subdomain (`www.example.com`, `app.example.com`), never `evilexample.com` |
+| `=app.example.com` | that exact host only |
+| `*` | every site |
+| `!docs.example.com` | an exception: never listed, with its subdomains |
+| `!=docs.example.com` | an exception for that exact host only |
+
+Exceptions beat every other rule, so `*` plus exceptions is an allowlist:
+`*` and `!mail.example.com` block new tabs everywhere except on
+`mail.example.com`. Input is lenient: case, a scheme, a path and a
+trailing dot are dropped, and a leading `www.` is dropped from a domain
+(`www.example.com` lists all of `example.com`), but kept in an exact rule,
+which names one host, and in an exception: dropping it from
+`!www.bank.com` would also except every other `bank.com` subdomain. IP addresses work (`127.0.0.1`,
+`[::1]`). After saving, the editor shows the list as stored and names
+every line it left out because it is not a domain or rule.
+
+The list is stored as one `chrome.storage.sync` item, so with browser sync
+on it follows you to other browsers signed in to the same profile. That
+item is limited by Chrome's per-item sync quota (8 KB, a few hundred
+domains). A list that would not fit is not saved: the options page and the
+popup say how large it is and what the limit is, and nothing changes. A
+copy of an older version of this extension on another synced device
+understands only plain domains: it ignores `=`, `*` and `!` rules, and if
+it saves the list there, it drops them for every device.
 
 To check it's working, open DevTools on the site (F12, then Console). Each
 blocked attempt is logged as `[no-new-tabs] blocked …`. The background
@@ -209,66 +240,94 @@ the extension's card).
 cd test
 npm install
 npx playwright-core install chromium   # one-time browser download
-node run.mjs
+npm test                               # unit tests, then the end-to-end suite in parallel
 ```
 
-This starts a local test site and loads the extension into Chromium. It
-uses Playwright's cached Chromium build, or the browser you name with
-`CHROME=/path/to/chrome`. Auto-detection of Playwright's Chromium only
-works on Linux: it looks for `chrome-linux64/chrome`
-([run.mjs:42-49](test/run.mjs#L42-L49)). On macOS or Windows, set `CHROME=`
-to a Chromium binary. Recent branded Chrome builds ignore
-`--load-extension`, so use Chromium. The test site listens on port 8799;
-set `PORT=` if that is taken.
+| Script | Runs | Time |
+| --- | --- | --- |
+| `npm run test:unit` | `node --test unit*.mjs`: 181 unit tests, no browser | under 1 s |
+| `npm run test:e2e` | `node run.mjs`: the end-to-end suite, one browser | about 4 min |
+| `npm run test:parallel` | `node parallel.mjs`: the same steps, split across browsers | about 70 s |
+| `npm run test:mutants` | `node mutants.mjs`: checks that the unit tests catch broken rules | about 3 s |
+
+**Browser.** The end-to-end suite loads the extension into Chromium. It
+uses the browser you name with `CHROME=/path/to/chrome`, else the Chromium
+build that the installed `playwright-core` downloads, found with
+`chromium.executablePath()` on any OS, else an older Playwright build in
+the Linux cache ([run.mjs › findChrome](test/run.mjs)). Recent branded
+Chrome builds ignore `--load-extension`, so use Chromium. The test site
+listens on port 8799; set `PORT=` if that is taken.
 
 ```bash
 # from test/
 CHROME=/usr/bin/chromium PORT=9000 node run.mjs
 ```
 
-The full run takes about four minutes, most of it waiting for tabs to
-settle. `test/parallel.mjs` splits the same steps across workers — one
-browser and one test server per shard, all assertions identical — which
-brings it down to about a minute on a many-core machine:
+**Parallel run.** Most of the four minutes is waiting for tabs to
+settle. `parallel.mjs` splits the same steps across workers, one browser
+and one test server per shard, all assertions identical. It asks
+`run.mjs` for the step table (`LIST_STEPS=1` prints it as JSON and exits),
+so a new step needs no change there: steps added since the default
+six-shard split was tuned join the last shard. Each worker takes its own
+`PORT` (`8799` plus the shard number).
 
 ```bash
 # from test/
-CHROME=/usr/bin/chromium node parallel.mjs        # 6 shards by default
-CHROME=/usr/bin/chromium SHARDS=4 node parallel.mjs
-CHROME=/usr/bin/chromium node parallel.mjs 0-7,8-15,16-30
+node parallel.mjs                 # 6 shards by default
+SHARDS=4 node parallel.mjs
+node parallel.mjs 0-7,8-15,16-31  # explicit step ranges
 ```
 
 `TEST_ONLY` runs a slice of the suite in one browser, for iterating on a
 single area (`TEST_ONLY=menuKept`, or exact `index:id` steps like
 `TEST_ONLY=3:,20:`; step ids are the test function names in the `STEPS`
-table at the bottom of `run.mjs`). Each worker takes its own `PORT`
-(`8799` plus the shard number).
+table at the bottom of `run.mjs`).
 
-Matching logic that a headless browser cannot drive (Brave's native
-"Go to <address>" item) is covered by unit vectors through the shipped
-code instead ([unit.mjs](test/unit.mjs)):
+**Unit tests** run the shipped code without a browser, for what a
+headless browser cannot drive or would take minutes to wait for:
 
-```bash
-# from test/
-node --test unit.mjs
-```
+- [unit.mjs](test/unit.mjs): the context-menu matchers in
+  `menu-match.js`, including Brave's native "Go to <address>" item.
+- [unit-match.mjs](test/unit-match.mjs): the site rules in `match.js`
+  (matching vectors, also with `match.js` run as a classic script the way
+  `arm.js` gets it), `normalizeRule`, the change the popup offers, and
+  saving at the sync quota.
+- [unit-prune.mjs](test/unit-prune.mjs),
+  [unit-fallbacks.mjs](test/unit-fallbacks.mjs),
+  [unit-state.mjs](test/unit-state.mjs),
+  [unit-background.mjs](test/unit-background.mjs): `background.js`
+  driven through a fake `chrome` API ([harness.mjs](test/harness.mjs)):
+  pruning 60 s after a frame leaves, cold-worker restore, the no-source
+  fallbacks, closed tabs forgotten after 30 s, the 1000-row cap, failed
+  saves, the menu record, the `inListedTab` reply, `*` and exceptions.
 
-Time-driven background behavior the headless suite cannot reach
-(pruning 60 s after a frame leaves, cold-worker restore, dead-frame
-pruning, the no-source fallbacks) runs against the shipped
-`background.js` through a fake `chrome` API
-([harness.mjs](test/harness.mjs)) instead
-([unit-prune.mjs](test/unit-prune.mjs),
-[unit-fallbacks.mjs](test/unit-fallbacks.mjs)):
+The harness owns a virtual clock: it replaces `setTimeout`, `setInterval`
+and `Date.now`, and `settle(ms)` moves time forward by exactly that much,
+running every timer that falls due in order. The worker's waits keep their
+real lengths (50 ms, 150 ms, 3 s, 30 s, 60 s) but cost no wall time, and
+runs are deterministic. That took the unit tests from 30 tests in 9.3 s
+to 181 tests in about 0.2 s.
 
-```bash
-# from test/
-node --test unit-prune.mjs unit-fallbacks.mjs
-```
+**Mutants.** `mutants.mjs` breaks one security-relevant rule at a time in
+a temporary copy of `extension/` and the unit tests (54 mutants: pruning by
+the wrong age, a label-unanchored domain match, an exception that no longer
+wins, a menu record that is not single-use, and so on) and runs the unit
+tests against each copy. A mutant counts as killed only when the tests it
+names fail. A survivor is a test gap: fix the tests, never the mutant. A
+mutant whose search text no longer occurs in the source is reported as
+stale. All 54 are killed in about 2.5 s; `--list`, `--only <names>` and
+`-v` help when one is not.
 
-The suite lists `localhost`, uses `127.0.0.1` as the unlisted control, and
-runs 308 checks (the run prints PASS or FAIL for each and ends with ALL
-PASSED):
+**Benchmark.** `node bench.mjs [ext-dir ...]` times hot DOM paths (frame
+inserts, `appendChild`, `setAttribute`, `contentWindow` reads) inside a
+listed and an unlisted page, against a browser with no extension. Pass two
+extension folders to compare builds within one run. It is not part of the
+suite, and it looks for Chromium only in the Linux cache; set `CHROME=`
+elsewhere.
+
+**What the end-to-end suite checks.** It lists `localhost`, uses
+`127.0.0.1` as the unlisted control, and runs 32 steps with 405 checks
+(the run prints PASS or FAIL for each and ends with ALL PASSED):
 
 - **69 ways of opening a tab.** These include cross-origin and nested
   iframes, and the tricks from the ad scripts seen on a real streaming
@@ -289,11 +348,17 @@ PASSED):
   hidden-frame open with and without leaving, and the six-redirect chain)
   are also run with the worker stopped first, as Chrome does after 30 s
   idle, and so are the listed-iframe "leaves" and "is removed" cases
-  ([run.mjs:664-673](test/run.mjs#L664-L673),
-  [run.mjs:684-691](test/run.mjs#L684-L691)).
+  ([run.mjs › tabUnder](test/run.mjs), [run.mjs › workerRestart](test/run.mjs)).
 - **Plain-http sites** (not secure contexts), picture-in-picture windows,
   and context menus: a right-click must not open the door for a link click
   that gets past the guard.
+- **Frames and sandboxes reached only one way** (`guardInsertions`):
+  `javascript:false` frames nested inside an inserted element, and
+  `allow-popups` added to an opaque sandbox by markup, by the parser
+  ([sandboxparse.html](test/site/sandboxparse.html)), before the page was
+  armed, or through each attribute-write route after insertion.
+- **The rule grammar** (`ruleGrammar`): with `*` and `!a.test`, `b.test`
+  is guarded while `a.test` and `x.a.test` are untouched.
 - **The reverse.** After you follow a link off a listed site, that site's
   popups still open.
 - **Your own tabs survive.** New tab, duplicate, extension-made tabs and
@@ -321,14 +386,25 @@ extension/
   guard.js        In-page guard, runs in the page's own (MAIN) world in every frame
   arm.js          Isolated-world partner of guard.js: decides listed/unlisted, arms or removes the guard,
                   reports context menus to the background
-  lib.js          Shared helpers: domain normalisation, host matching, siteOf()
-  popup.html/js   Toolbar popup: add or remove the current site
-  options.html/js Domain list editor
+  match.js        Site rules (domain, =exact, *, !exception): the one matcher, loaded before arm.js
+                  and imported by lib.js
+  lib.js          Shared helpers: rule normalisation, saving the list, siteOf(), the popup's toggle
+  menu-match.js   Pure context-menu matchers used by background.js (search, "Go to", image srcs)
+  popup.html/js   Toolbar popup: add, remove or except the current site
+  options.html/js Rule list editor
   icons/          Toolbar and store icons (16, 32, 48, 128 px)
 test/
   run.mjs         End-to-end suite (Playwright for the full extension, raw CDP elsewhere)
+  parallel.mjs    Runs run.mjs's steps in parallel shards
   cdp.mjs         Minimal raw Chrome DevTools Protocol driver
-  package.json    One dev dependency: playwright-core
+  harness.mjs     Fake chrome API and virtual clock for background.js unit tests
+  unit.mjs        Context-menu matcher vectors (menu-match.js)
+  unit-match.mjs  Site rules, normalisation, popup toggle, sync quota
+  unit-prune.mjs, unit-fallbacks.mjs, unit-state.mjs, unit-background.mjs
+                  background.js through the harness: pruning, fallbacks, state, decisions
+  mutants.mjs     Mutation runner: each mutant must make a named unit test fail
+  bench.mjs       Micro-benchmark of the guard's cost on hot DOM paths (not part of the suite)
+  package.json    One dev dependency (playwright-core) and the npm test scripts
   site/           Test pages served by run.mjs
     index.html      Main page: most cases, the ad-script tricks, tab-under buttons
     v14.html        Edge cases: whitespace targets, sandboxed frames, targets changed late,
@@ -340,13 +416,16 @@ test/
     base.html       <base target=_blank>
     frame.html, nest.html  Cross-origin frame and a frame nested one level deeper
     sib.html        Sibling frame that targets a named iframe
+    opaque.html     A _blank link, loaded into opaque sandboxed frames
+    sandboxparse.html  A parser-inserted opaque frame that asks for allow-popups
     target.html     Landing page for every case
-    data.json       Used by the fetch() check
+    data.json, px.png  Used by the fetch() and context-menu image checks
 ```
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is the post-review design note:
 verdicts on the two layers, injection scope and background state, the
-measured cost of the guard, and the follow-up issues.
+measured cost of the guard, what the later improvement pass fixed and
+measured, and the follow-up issues.
 
 ## How it works: every trick
 
@@ -355,7 +434,9 @@ code does about it, and why the obvious approach fails.
 
 ### Terms used below
 
-- **Listed**: on a domain in your list, or a subdomain of one.
+- **Listed**: on a host a rule in your list covers (a listed domain or one
+  of its subdomains, an exact host, or every host for `*`), and not on an
+  exception.
 - **Tab-under**: an ad opens a new tab, then at once moves the original tab
   elsewhere (or closes it). By the time anyone looks, the opener no longer
   shows the listed page.
@@ -393,7 +474,7 @@ code does about it, and why the obvious approach fails.
 
 The background layer works on its own. The test suite runs every case
 against a copy of the extension with the content scripts deleted
-([run.mjs:54-63](test/run.mjs#L54-L63)). The in-page layer exists so you
+([run.mjs › backgroundOnlyCopy](test/run.mjs)). The in-page layer exists so you
 don't see a tab open and close.
 
 #### Two scripts in two worlds, both at `document_start` in every frame
@@ -405,17 +486,16 @@ cannot read the domain list. And anything in the page's world can be
 watched or tampered with by page scripts.
 
 **What it does.** The manifest declares `guard.js` with `world: "MAIN"` and
-`arm.js` in the default isolated world
-([manifest.json:18-42](extension/manifest.json#L18-L42)). Both use
+`match.js` + `arm.js` in the default isolated world
+([manifest.json › content_scripts](extension/manifest.json)). Both use
 `run_at: document_start`, `all_frames: true`,
 `match_origin_as_fallback: true` and `<all_urls>`. `guard.js` is listed
 first, so its listeners exist before `arm.js` sends anything. `guard.js` does
 all the patching and stays inert until armed. `arm.js` reads the list,
 decides, and sends the answer to `guard.js` through DOM events. The second
-content script has no `world` key, so `arm.js` runs in the isolated world
-([manifest.json:31-41](extension/manifest.json#L31-L41)). It has its own
-copies of the JS built-ins, and page code cannot change what it reads or
-calls.
+content script has no `world` key, so `match.js` and `arm.js` run in the
+isolated world, in that order. They have their own copies of the JS
+built-ins, and page code cannot change what they read or call.
 
 **Why not the obvious way.** A single MAIN-world script cannot read the
 extension's storage. A single isolated-world script cannot change the
@@ -429,10 +509,12 @@ first.
 #### Permissions
 
 `tabs` (to read `url` and `pendingUrl`), `webNavigation` (`onCommitted`,
-`onCreatedNavigationTarget`, `getAllFrames`) and `storage` (`sync` for the
-list, `session` for state), with `<all_urls>` host permissions
-([manifest.json:6-17](extension/manifest.json#L6-L17)). The worker is a
-module (`"type": "module"`) so it can import [lib.js](extension/lib.js).
+`onCreatedNavigationTarget`, `getAllFrames`), `storage` (`sync` for the
+list, `session` for state) and `dom` (closed shadow roots, for the
+[context-menu record](#armjs-reports-menus-from-trusted-events-only)), with `<all_urls>` host permissions
+([manifest.json › permissions](extension/manifest.json)). The worker is a
+module (`"type": "module"`) so it can import [lib.js](extension/lib.js)
+(which imports `match.js`) and [menu-match.js](extension/menu-match.js).
 
 ### Background enforcer
 
@@ -452,18 +534,18 @@ or `chrome.tabs.create` from another extension.
 
 **What it does.** `pageCreated(tab)` is true only when `tab.openerTabId` is
 set and the tab has neither `pendingUrl` nor `url`
-([background.js:237-241](extension/background.js#L237-L241)). A tab created
+([background.js › pageCreated](extension/background.js)). A tab created
 by page script arrives at `tabs.onCreated` with no address at all. Tabs the
 browser creates for the user always carry one. Only page-made tabs go down
 the `onCreated` decision path
-([background.js:316-322](extension/background.js#L316-L322)).
+([background.js › tabs.onCreated listener](extension/background.js)).
 
 **Why not the obvious way.** `openerTabId` looks like the natural signal,
 but Chrome sets it for Ctrl+T from a tab too. Keying on it would close the
 user's own new tabs. The tests reproduce those shapes (`createTarget`
 newtab and about:blank, duplicate, `tabs.create` with an opener,
 `windows.create`) and require them all to survive
-([run.mjs:472-504](test/run.mjs#L472-L504)).
+([run.mjs › userTabsSurvive](test/run.mjs)).
 
 ##### Browser-made tabs from the page's links are judged too
 
@@ -473,7 +555,7 @@ and dragging a link all create tabs that do have a `pendingUrl`, so
 
 **What it does.** `webNavigation.onCreatedNavigationTarget` fires for these
 tabs as well, and always starts a decision when no waiter exists
-([background.js:337-351](extension/background.js#L337-L351)). They are
+([background.js › onCreatedNavigationTarget listener](extension/background.js)). They are
 judged by their source frame and closed if it was listed, unless the
 [context-menu exemption](#context-menu-exemption) applies.
 
@@ -493,14 +575,14 @@ an ad script's hidden `<iframe src="javascript:false">`.
 
 **What it does.** For a page-made tab, `waitForNavSource(tabId)` is
 registered synchronously, before any `await`
-([background.js:323](extension/background.js#L323)). It resolves with the
+([background.js › tabs.onCreated listener](extension/background.js)). It resolves with the
 navigation details if they arrive within `NAV_WAIT_MS = 50`, or with
-`null` on timeout ([background.js:252-262](extension/background.js#L252-L262)).
+`null` on timeout ([background.js › waitForNavSource](extension/background.js)).
 If the navigation event came first, it was stored in `navEarly` (kept 5 s)
 and the wait resolves at once. With details, `decideFromNav` judges the
 exact source frame. With `null`, the opener tab's top frame is judged,
 because the browser does not say which frame opened it
-([background.js:324-334](extension/background.js#L324-L334)).
+([background.js › tabs.onCreated listener](extension/background.js)).
 
 **Why not the obvious way.** Relying on `onCreatedNavigationTarget` alone
 misses the hidden `javascript:false` iframe trick that real ad networks
@@ -519,9 +601,9 @@ starts its own decision. If `onCreated` already has a pending decision for
 that tab, the new one is chained:
 `pending.then(listed => listed || decideFromNav(details, atSeq))`, so a
 "not listed" verdict from the coarse fallback gets a second look with the
-exact frame ([background.js:339-351](extension/background.js#L339-L351)).
+exact frame ([background.js › onCreatedNavigationTarget listener](extension/background.js)).
 `tabs.onCreated` returns early if a decision already exists, which means the
-navigation event came first ([background.js:322](extension/background.js#L322)).
+navigation event came first ([background.js › tabs.onCreated listener](extension/background.js)).
 
 **Why not the obvious way.** Without the chain, a navigation event arriving
 just after the 50 ms window would be dropped. Without the check in
@@ -536,9 +618,9 @@ tab was created, even if `onCreatedNavigationTarget` arrives later.
 **What it does.** In `tabs.onCreated`, any tab with an opener gets
 `born.set(tab.id, { url: tab.pendingUrl || tab.url, atSeq })`, where
 `atSeq = seq + 1`. Entries expire after 10 s
-([background.js:316-321](extension/background.js#L316-L321)). The late
+([background.js › tabs.onCreated listener](extension/background.js)). The late
 navigation handler reuses that `atSeq`
-([background.js:345](extension/background.js#L345)).
+([background.js › onCreatedNavigationTarget listener](extension/background.js)).
 
 **Why not the obvious way.** `atSeq` is taken synchronously at creation,
 before any `await`. A navigation the opener commits afterwards cannot change
@@ -552,9 +634,9 @@ example a popup that opens another popup before its own verdict is known.
 **What it does.** `track(tabId, decision)` stores the promise and removes it
 once it settles, but only if it is still the stored one, so a newer chained
 decision is not wiped. `decision.catch(() => false)` keeps a rejection from
-becoming unhandled ([background.js:171-179](extension/background.js#L171-L179)).
+becoming unhandled ([background.js › track](extension/background.js)).
 `wasListed()` waits for a source tab's pending verdict and treats `true` as
-listed ([background.js:218-226](extension/background.js#L218-L226)).
+listed ([background.js › wasListed](extension/background.js)).
 
 **Why not the obvious way.** A popup's child can be created before the popup
 itself is closed. Waiting for the parent's verdict is what makes popup
@@ -567,15 +649,15 @@ from its own load-time script.
 
 **What it does.** `block()` adds the tab to `spawned` and schedules a save,
 then calls `chrome.tabs.remove(...)`
-([background.js:228-233](extension/background.js#L228-L233)). The save is
+([background.js › block](extension/background.js)). The save is
 debounced, so the storage write lands after the remove call
-([background.js:78-97](extension/background.js#L78-L97)). `wasListed()`
+([background.js › persist](extension/background.js)). `wasListed()`
 returns true at once for a source in `spawned`
-([background.js:220](extension/background.js#L220)). The `inListedTab`
+([background.js › wasListed](extension/background.js)). The `inListedTab`
 reply also reports a spawned tab as listed
-([background.js:371](extension/background.js#L371)), so `arm.js` arms the
+([background.js › runtime.onMessage listener](extension/background.js)), so `arm.js` arms the
 guard inside a popup that is about to be closed. The saved list keeps the
-last 500 ids ([background.js:86](extension/background.js#L86)).
+last 500 ids ([background.js › save](extension/background.js)).
 
 **Why not the obvious way.** By the time the child is judged, the closed
 popup no longer shows a listed site. It may be `about:blank` or an
@@ -593,14 +675,14 @@ opener no longer shows the listed site.
 
 **What it does.** `webNavigation.onCommitted` records, per tab, a list of
 `{ f: frameId, p: parentFrameId (-1 for top), h: host, t: d.timeStamp, seq }`
-in event order ([background.js:114-149](extension/background.js#L114-L149)).
+in event order ([background.js › onCommitted listener](extension/background.js)).
 `seq` is a worker-wide counter that goes up on every commit. Only the host
 is kept, never the URL. An entry is added only when the frame's site
-actually changes ([background.js:138-140](extension/background.js#L138-L140)).
+actually changes ([background.js › onCommitted listener](extension/background.js)).
 
 This history covers every tab and frame, on every site, whether or not it is
 listed and even while the list is empty: `onCommitted` never looks at the
-list ([background.js:114-149](extension/background.js#L114-L149)). It holds
+list ([background.js › onCommitted listener](extension/background.js)). It holds
 host names only and lives in memory and `chrome.storage.session` (which
 content scripts cannot read by default), so it is gone when the browser
 closes. It is never sent anywhere. The design needs it this way: a
@@ -619,14 +701,14 @@ entries restored after a worker restart have no meaningful `seq`.
 
 **What it does.** `entryAt(entries, frameId, { atSeq, atTime })` returns the
 frame's last entry with `seq < atSeq`, or with `t <= atTime`
-([background.js:162-169](extension/background.js#L162-L169)).
+([background.js › entryAt](extension/background.js)).
 `decideFromNav` checks both `{ atSeq }` (worker event order at
 `tabs.onCreated`) and `{ atTime: details.timeStamp }` (the browser's own
 timestamp on the navigation-target event). The tab counts as opened by a
 listed page if either moment says so
-([background.js:299-306](extension/background.js#L299-L306)). The opener-only
+([background.js › decideFromNav](extension/background.js)). The opener-only
 fallback has no browser timestamp and uses `{ atSeq }` only
-([background.js:331](extension/background.js#L331)).
+([background.js › tabs.onCreated listener](extension/background.js)).
 
 **Why not the obvious way.** The worker's event order and the browser's
 timestamps can disagree. A tab-under may reach the worker as the opener's
@@ -635,10 +717,10 @@ created the popup first. Restored entries also have no real place in this
 worker's order. So the opener is judged both ways, and the tab counts as
 opened by a listed page if either view says so: a fast navigate-away cannot
 hide the listed state from both. Restored entries get `seq 0`, which always
-counts as "before" ([background.js:49](extension/background.js#L49)).
+counts as "before" ([background.js › unpack](extension/background.js)).
 Test: "hidden-frame open, then 6 redirects", served by a `/chain?n=N` route
 that redirects with `location.replace`
-([run.mjs:70-75](test/run.mjs#L70-L75)).
+([run.mjs › server](test/run.mjs), the `/chain` route).
 
 ##### Walking up the frame tree as it was (`frameWasListed`)
 
@@ -649,7 +731,7 @@ also have navigated away or been removed since.
 **What it does.** Starting from the source frame, each step takes that
 frame's entry at the moment, checks whether its host is listed, then moves
 to its recorded parent. It stops at frame 0 and is capped at 32 hops
-([background.js:184-214](extension/background.js#L184-L214)). If a subframe
+([background.js › frameWasListed](extension/background.js)). If a subframe
 has no entry (it never committed a document, such as an `about:blank` made
 by script), `webNavigation.getAllFrames` is fetched once and the walk
 continues from where that frame sits now. If the frame is not live either,
@@ -674,17 +756,17 @@ URLs have no host of their own, or one that hides the creator.
 its host, anything else (`blob:null/…` from an opaque origin) gives `null`.
 `about:`, `data:` and `javascript:` give `null`: their origin comes from
 whoever made them. Any other scheme (`chrome:`, `file:`) and unparseable
-input give `""` ([lib.js:25-42](extension/lib.js#L25-L42)).
+input give `""` ([lib.js › siteOf](extension/lib.js)).
 
 **Why not the obvious way.** `new URL("blob:https://listed/…").hostname` is
 `""`, which would make a listed page's blob copy look unlisted. Only
 top-frame commits treat the two differently: a `null` host inherits the
 previous top-frame site (unless the user typed the address), while `""`
-stays unlisted ([background.js:278-282](extension/background.js#L278-L282)).
+stays unlisted ([background.js › USER_TRANSITIONS](extension/background.js)).
 `arm.js`'s `inListedTab` question uses the top-frame result too. In the
 frame walk both are falsy, so a subframe with either one defers to its
 parent: any frame under a listed frame counts as listed whatever its own
-host ([background.js:209-211](extension/background.js#L209-L211)).
+host ([background.js › frameWasListed](extension/background.js)).
 
 ##### Top-frame pages with no site inherit the previous one unless the user typed them
 
@@ -696,7 +778,7 @@ open popups from a page that has no host.
 host is set to `""` if the transition type is one the user makes (`typed`,
 `auto_bookmark`, `generated`, `keyword`, `keyword_generated`, `start_page`,
 `auto_toplevel`). Otherwise it is the previous top-frame host
-([background.js:109-124](extension/background.js#L109-L124)). So when a
+([background.js › USER_TRANSITIONS](extension/background.js)). So when a
 link, redirect, script or reload takes the top frame to an `about:blank`,
 `data:` or `blob:null` page, that page keeps the site that was there. A
 navigation to an ordinary http(s) address records the new host.
@@ -715,14 +797,30 @@ judged by them, but the history must not grow forever.
 
 **What it does.** On a top-frame commit, every subframe entry without a
 `left` time gets `left = d.timeStamp`. An entry whose `left` is more than
-60 s before this commit is removed
-([background.js:127-137](extension/background.js#L127-L137)). A marked entry
-also fails the "same site as before" check, so a later commit in the same
-frame id is recorded again ([background.js:139](extension/background.js#L139)).
+60 s before this commit is removed. A marked entry also fails the "same
+site as before" check, so a later commit in the same frame id is recorded
+again. The tab's rows are saved whenever a stamp or a removal happened,
+even when the commit itself records nothing new (a same-site top
+navigation): otherwise the stored rows would still show those frames as
+never left, and a restore after a worker stop would bring them back
+([background.js › onCommitted listener](extension/background.js), the
+`stamped` flag).
+
+A page that never commits a new top frame (a single-page app, infinite
+scroll) never marks its dead subframes. `pruneDead` runs at most once a
+minute, before a save, on tabs with at least 200 rows: it drops subframe
+rows not marked as left whose frame is no longer in the tab and that are
+older than 60 s
+([background.js › pruneDead](extension/background.js)). When the tab's
+frames cannot be read (`liveFrames` returns `null` for a closed or invalid
+tab), the rows are kept.
 
 **Why not the obvious way.** Deleting the old page's frames on navigation
 would lose the evidence when an iframe opens a popup and the page leaves at
-once.
+once. Pruning by when a row was recorded, not when its frame left, would
+drop a listed iframe that loaded long ago and opened a popup a moment
+before its page left. Reading an unreadable frame list as "no frames" would
+prune every old subframe row of the tab.
 
 ##### A 1000-entry cap that fails closed
 
@@ -733,9 +831,9 @@ make a listed origin forgotten.
 **What it does.** Above `MAX_ENTRIES` (1000), the oldest subframe entry is
 dropped first. Only if there are none is the oldest top-frame entry dropped,
 and the tab is then added to `trimmed`
-([background.js:141-147](extension/background.js#L141-L147)). In
+([background.js › capHistory](extension/background.js)). In
 `frameWasListed`, a trimmed tab with no top entry at the moment counts as
-listed ([background.js:195-196](extension/background.js#L195-L196)).
+listed ([background.js › frameWasListed](extension/background.js)).
 
 **Why not the obvious way.** Once the earliest top entries are gone, what
 the tab showed back then is unknown. Treating it as listed is the safe
@@ -749,10 +847,29 @@ saw them.
 
 **What it does.** `onCommitted` returns at once for
 `documentLifecycle === "prerender"`
-([background.js:115](extension/background.js#L115)).
+([background.js › onCommitted listener](extension/background.js)).
 
 **Why not the obvious way.** A prerendered page would otherwise rewrite the
 tab's top-frame history and could flip later verdicts.
+
+##### Pages restored from the back/forward cache
+
+**Problem.** A page restored from the back/forward cache commits its top
+frame again, but its subframes do not re-commit, so the history misses
+them. A popup from such a page often has no navigation source.
+
+**What it does.** A top-frame commit with the `forward_back` qualifier
+puts the tab in `restoredTabs` and records the live subframes from
+`getAllFrames` with the commit's timestamp. While that page is current, a
+no-source popup counts as listed if any recorded frame of the page was
+listed (the walks share one `getAllFrames` snapshot), or if a fresh look
+finds a listed live subframe, in case that record is still being written
+([background.js › openerWasListed](extension/background.js)).
+Any other top-frame commit takes the tab out of `restoredTabs`.
+
+**Why not the obvious way.** Without the live record, a listed iframe on
+a restored unlisted page would open popups the history knows nothing
+about. Judging only the top frame would miss it the same way.
 
 #### Surviving service-worker restarts
 
@@ -762,25 +879,27 @@ tab's top-frame history and could flip later verdicts.
 A popup opened from a page you have been reading for a while usually wakes a
 cold worker with no history in memory.
 
-**What it does.** `spawned`, `history` (packed into arrays
-`[f, p, h, t, left]`), `trimmed`, `menus` and `gone` are written to
-`chrome.storage.session` ([background.js:47-97](extension/background.js#L47-L97)).
-On startup a single `restored` promise reads them. Saved history rows are
-placed before anything this worker has already recorded and get `seq 0`.
-Saved menus and closed-tab records never overwrite newer in-memory ones.
-Every decision path and the `inListedTab` reply wait for `restored` first
-([background.js:303](extension/background.js#L303),
-[background.js:329](extension/background.js#L329),
-[background.js:370](extension/background.js#L370)).
+**What it does.** Each tab's history rows (packed into arrays
+`[f, p, h, t, left]`) are written under their own key `h.<tabId>`, and the
+small sets `spawned`, `trimmed`, `restoredTabs`, `menus` and `gone` under
+one key each, to `chrome.storage.session`
+([background.js › save](extension/background.js)). On startup a single
+`restored` promise reads them. Saved history rows are placed before
+anything this worker has already recorded and get `seq 0`. Saved menus and
+closed-tab records never overwrite newer in-memory ones. Every decision
+path and the `inListedTab` reply wait for `restored` first
+([background.js › decideFromNav](extension/background.js), the
+`tabs.onCreated` listener, the `runtime.onMessage` listener). Only the
+per-tab format is read. The single `history` key of earlier versions is no
+longer migrated: Chrome clears session storage whenever the extension is
+reloaded or updated, so no version finds another version's state.
 
 Tab ids are object keys in storage, so they come back as strings and are
 converted with `+id` before use
-([background.js:55-59](extension/background.js#L55-L59)). Otherwise no
+([background.js › restored](extension/background.js)). Otherwise no
 restored record would match a numeric `tabId`. A failed read is caught
-before the seeding step
-([background.js:62-63](extension/background.js#L62-L63)), so the worker
-still seeds every open tab from what it shows now and `restored` always
-resolves.
+before the seeding step, so the worker still seeds every open tab from
+what it shows now and `restored` always resolves.
 
 **Why not the obvious way.** Events can arrive before the restore finishes,
 so the restore merges with memory instead of replacing it. Session storage
@@ -794,11 +913,14 @@ started have no recorded commits.
 
 **What it does.** After restore, every tab without a restored top-frame
 entry gets `{ f: 0, p: -1, h: siteOf(url) ?? "", t: 0, seq: 0 }` at the
-front ([background.js:63-73](extension/background.js#L63-L73)). A tab
+front ([background.js › restored](extension/background.js)). A tab
 showing `about:blank` at startup has nothing to inherit from, so it is
-seeded as unlisted. Separately,
-`frameWasListed` falls back to the tab's current URL when the top frame has
-no entry at all ([background.js:197-199](extension/background.js#L197-L199)).
+seeded as unlisted. A tab with no saved rows at all (an extension reload
+clears session storage) also goes into `unknownTabs`: until its first
+top-frame commit is seen, what it showed is unknown, so a popup from it
+counts as listed. Separately, `frameWasListed` falls back to the tab's
+current URL when the top frame has no entry at all
+([background.js › frameWasListed](extension/background.js)).
 
 **Why not the obvious way.** `t: 0` and `seq: 0` make the seed come before
 every real event, so it never hides a later commit. The test is "has a
@@ -807,19 +929,28 @@ have recorded new commits before the restore finished.
 
 ##### Debounced writes that never leave a stale record
 
-**Problem.** `onCommitted` fires often. A failed write (for example, the
-session quota) could leave an older history in storage, to be restored
-later and give wrong verdicts.
+**Problem.** `onCommitted` fires often, and ad-heavy pages commit frames
+many times a second. A failed write (for example, the session quota) could
+leave an older history in storage, to be restored later and give wrong
+verdicts.
 
-**What it does.** `persistTimer ??= setTimeout(…, 0)` merges all calls in
-one tick into one write, and the write waits for `restored`. Each write
-takes a number. If it fails, and no newer write has started, it removes the
-`history` and `trimmed` keys ([background.js:76-97](extension/background.js#L76-L97)).
+**What it does.** `persist()` merges calls into one write at most every
+`PERSIST_DEBOUNCE_MS` (150 ms); a block or a menu record writes at once,
+since the worker can be stopped at any moment. `save()` runs one pass at a
+time, waits for `restored`, and writes only the tabs marked dirty (plus the
+small sets when they changed). Each write takes a number. If it fails, and
+no newer write has started, it removes every `h.<tabId>` key, `trimmed` and
+`restoredTabs`, and marks every tab and the small sets dirty again, so
+the next save (whatever event schedules it) writes all of them back
+rather than only what changed since
+([background.js › persist](extension/background.js),
+[background.js › save](extension/background.js)).
 
-**Why not the obvious way.** A stale snapshot is worse than none. A missing
-record falls back to current URLs, while an old one gives confident wrong
-answers. The counter stops a late failure of an old write from deleting
-what a newer write saved.
+**Why not the obvious way.** Rewriting the whole history on every commit
+costs more the longer a tab lives. A stale snapshot is worse than none. A
+missing record falls back to current URLs, while an old one gives
+confident wrong answers. The counter stops a late failure of an old write
+from deleting what a newer write saved.
 
 ##### Closed tabs are remembered for 30 s
 
@@ -828,12 +959,13 @@ what a newer write saved.
 the only evidence.
 
 **What it does.** `tabs.onRemoved` records the time in `gone` and persists.
-It also schedules `setTimeout(persist, 31_000)`, because `persist()` runs
+It also schedules `setTimeout(persist, 31_000)`, because a save runs
 `forgetGone()`, which deletes everything about tabs closed at least 30 s
-ago ([background.js:99-107](extension/background.js#L99-L107),
-[background.js:151-155](extension/background.js#L151-L155)). `forgetGone()`
+ago, from every per-tab set listed in `PER_TAB`
+([background.js › forgetGone](extension/background.js)). `forgetGone()`
 also runs after restore, so a worker that slept through the window still
-cleans up.
+cleans up: the forgotten tabs are marked dirty there, so the next save
+removes their saved `h.<tabId>` rows too instead of leaking them.
 
 **Why not the obvious way.** Cleaning up in `onRemoved` breaks the
 `window.close()` tab-under. Test: "hidden-frame open, then window.close()".
@@ -848,39 +980,61 @@ be able to use this as a loophole.
 
 **What it does.** A capture `contextmenu` listener in `arm.js` runs only
 when the frame is armed and `e.isTrusted`
-([arm.js:173-194](extension/arm.js#L173-L194)). It sends
+([arm.js › onContextMenu](extension/arm.js)). It sends
 `{ type: "contextMenu", selection, srcs }`. `srcs` are the `currentSrc` and
 `src` of images and media along `e.composedPath()` (which crosses open
 shadow roots), plus `<source src>` children of media. Closed shadow trees
 hide their nodes from `composedPath()`, so the elements under the pointer
 are walked separately with `elementFromPoint()`, stepping into each open
 or closed root with `chrome.dom.openOrClosedShadowRoot` (needs the `"dom"`
-permission, [manifest.json:6-11](extension/manifest.json#L6-L11)). That walk
+permission, [manifest.json › permissions](extension/manifest.json)). That walk
 also collects SVG `<image>` (`href` resolved against the document) and
 `<input type=image>` (`.src`), which the browser treats as images for the
 menu but which are not `HTMLImageElement`. If `getSelection()` is empty,
 the selection is read from the focused input or textarea, because the
 Selection API does not see text selected inside form fields. The background
 keys the record by `sender.tab.id`, which comes from the browser, keeps at
-most 20 string `srcs` and 500 characters of selection, and stamps the time
-([background.js:662-673](extension/background.js#L662-L673)).
+most 20 distinct string `srcs` (no `data:` addresses, each cut at 2 KB)
+and 500 characters of selection, stamps the time, and saves at once
+([background.js › runtime.onMessage listener](extension/background.js)).
+
+The listeners are named functions (`onPointerDown`, `onContextMenu`,
+`onUntrustedActivation`, `onKeyDown`, `onMenuGone`), and `listenMenus()`
+re-adds them from an observer after `document.open()` drops them. The
+browser ignores a second add of the same function, so re-running on an
+intact document adds nothing
+([arm.js › listenMenus](extension/arm.js)).
 
 **Why not the obvious way.** A page can dispatch a synthetic `contextmenu`,
 so `isTrusted` is required. Running in the isolated world means page changes
 to prototypes or `getSelection` cannot change what is read. `e.target`
 alone would miss shadow-DOM images and the source the browser chose from
-`srcset`, and "Open image in new tab" uses `currentSrc`.
+`srcset`, and "Open image in new tab" uses `currentSrc`. Fresh anonymous
+listeners on every re-run would pile up, and two `contextmenu` listeners
+are a hole, not just waste: the first uses up the selection taken at the
+button press and reports `""`, the second then sees no press and reports
+the selection the page planted on `mousedown`, replacing the first
+record.
 
-##### The record ends on the next `mousedown` or `keydown`
+##### The record ends on the next press, key, blur or synthetic click
 
 **Problem.** The worker must forget the menu as soon as it is gone, so a
 page-opened tab right after cannot match its leftovers.
 
-**What it does.** Trusted `mousedown` and `keydown` in the capture phase
-send `contextMenuClosed` ([arm.js:163-172](extension/arm.js#L163-L172), [arm.js:207-211](extension/arm.js#L207-L211)). While
-a native context menu is open the page receives neither, so the first one
-means the menu has closed. The background deletes the record
-([background.js:677-679](extension/background.js#L677-L679)).
+**What it does.** A trusted `pointerdown` (other than the right button
+that opens the menu) or `keydown` in the capture phase, and a `blur` or
+`visibilitychange` while the menu is open, send `contextMenuClosed`
+([arm.js › onPointerDown](extension/arm.js),
+[arm.js › onKeyDown](extension/arm.js),
+[arm.js › onMenuGone](extension/arm.js)). While a native context menu is
+open the page receives none of them, so the first one means the menu has
+closed. The background deletes the record
+([background.js › runtime.onMessage listener](extension/background.js)).
+Every untrusted `click` or `auxclick` the page dispatches is reported as
+`untrustedActivation`, which voids the record: a genuine menu pick
+involves no page activation. These are never coalesced, because the
+record belongs to the whole tab and another frame can write a fresh one
+in the middle of a task ([arm.js › onUntrustedActivation](extension/arm.js)).
 
 **Why not the obvious way.** `pointermove` looks like the quickest "user is
 back" signal, but moving the pointer does not close a menu. Moves around the
@@ -888,16 +1042,19 @@ back" signal, but moving the pointer does not close a menu. Moves around the
 record before the user could pick anything. Test: "a click in the page ends
 the menu".
 
-##### A single-use, five-minute, address-matched exemption
+##### A single-use, 30-second, address-matched exemption
 
 **Problem.** Only the tab the menu actually offered should be kept. The
 site's own links opened in new tabs must stay blocked, even right after a
 context menu.
 
 **What it does.** `fromUserMenu` runs only after the source is found to be
-listed ([background.js:599-601](extension/background.js#L599-L601)). It needs
-`born.get(tabId).url`, which exists only for browser-made tabs. It needs a
-menu record for the source tab less than 300 s old. `offeredByMenu` then
+listed ([background.js › decideFromNav](extension/background.js)). It needs
+an address the browser gave the tab (`born.get(tabId).url`), which exists
+only for browser-made tabs. It needs a menu record for the source tab less
+than `MENU_WINDOW_MS` (30 s) old and not voided by a synthetic click; it
+waits 50 ms and checks the record again, in case such a click is still in
+flight. `offeredByMenu` then
 accepts the URL — what the tab was born with, or what the navigation event
 names (a ctrl-clicked tab carries no address at creation) — if it equals one of the reported `srcs`, if it is the
 selected address itself (Brave's "Go to <address>": the selection parsed
@@ -906,7 +1063,8 @@ host and path exactly — not as a substring — and case-insensitively), or
 if the selection, whitespace-collapsed, lowercased and cut to 50
 characters (and not empty), appears in a decoded query-parameter value of
 the URL. On a match the record is deleted: one tab per menu
-([background.js:550-590](extension/background.js#L550-L590)).
+([background.js › fromUserMenu](extension/background.js),
+[menu-match.js › offeredByMenu](extension/menu-match.js)).
 
 **Why not the obvious way.** A page-made tab has no address at creation, so
 a page can never use the exemption by calling `window.open`. An empty
@@ -927,8 +1085,8 @@ for …" on text in a PDF on a listed site has no menu record.
 hold: the source frame is not the top frame; the URL matches `SEARCH`; the
 URL is not itself listed; the tab's recorded history has no entry for that
 frame id; and `getAllFrames` does not list it (the browser's own internal
-frame) ([background.js:583-590](extension/background.js#L583-L590)).
-`SEARCH` is anchored at `^https://`, allows an optional `www.`, a fixed
+frame) ([background.js › fromUserMenu](extension/background.js)).
+`SEARCH` ([menu-match.js › SEARCH](extension/menu-match.js)) is anchored at `^https://`, allows an optional `www.`, a fixed
 list of engines (Google and Yandex on any 2–3 letter top-level domain, and
 Google also with a 2-letter second part such as `.co.uk`) and their search
 paths, and requires `?` straight after the path.
@@ -955,7 +1113,7 @@ answers "listed" if the tab's URL is listed, if its latest top-frame history
 host is listed (which covers `blob:` and `about:blank` pages that inherited
 the site), or if the tab is a popup of a listed site (in `spawned`, or its
 pending verdict is true). The handler returns `true` to keep the reply
-channel open ([background.js:366-377](extension/background.js#L366-L377)).
+channel open ([background.js › runtime.onMessage listener](extension/background.js)).
 
 **Why not the obvious way.** `sender.tab.url` alone fails for a page that
 turned itself into `blob:null`. Reporting popups in flight as listed arms
@@ -967,34 +1125,63 @@ chains.
 `getDomains()` caches the `loadDomains()` promise with `??=`, so callers
 during the first load share one read. A change to `storage.sync` replaces the
 cache with the new value and refreshes every badge
-([background.js:8-17](extension/background.js#L8-L17)). Every decision path
-returns early when the list is empty.
+([background.js › getDomains](extension/background.js)). Every decision path
+returns early when the list is empty. A read that fails stays cached until
+the list changes or the worker restarts (a known follow-up).
 
-##### Domain matching
+##### Site rules: one matcher for every part
 
-`normalizeDomain` lowercases and trims, adds `http://` when there is no
-scheme so the URL parser can extract the host (which also turns IDN input
-into punycode), strips a leading `www.` and a trailing dot, and accepts only
-names that match a strict label pattern or a bracketed IPv6 address
-([lib.js:3-17](extension/lib.js#L3-L17)). `hostIsBlocked` lowercases, strips
-a trailing dot and matches `h === d || h.endsWith("." + d)`
-([lib.js:19-23](extension/lib.js#L19-L23)). A bare `endsWith(d)` would match
-`evilexample.com`, and a trailing-dot name (`example.com.`) would otherwise
-get past the list. Because of the `www.` strip
-([lib.js:15](extension/lib.js#L15)), entering `www.example.com` lists all of
-`example.com`. `saveDomains` stores the whole list as one sorted,
-de-duplicated `chrome.storage.sync` item
-([lib.js:53-57](extension/lib.js#L53-L57)), so it is bound by the sync
-per-item quota.
+**Problem.** The in-page decision (`arm.js`), the background, the popup
+and the options page must agree on which hosts are listed, or a page would
+be guarded by one layer and not the other. Matching must also be
+label-anchored, and cheap in every frame of every page whatever the size
+of the list.
+
+**What it does.** [match.js](extension/match.js) is the one definition. It
+has no `import` or `export`, so it loads two ways: as a classic content
+script just before `arm.js` in the isolated world (never in the page's
+world, where a page could read or poison it), and through
+`import "./match.js"` in `lib.js` for the worker, popup, options page and
+unit tests. It sets `globalThis.NoNewTabsMatch`.
+
+`parseRule` reads `example.com`, `=host`, `*`, `!host` and `!=host`.
+`covering(host, rules)` returns the rule that lists a host, or `undefined`:
+an exception (`!`) that covers the host wins over everything; otherwise
+the most specific exact or domain rule, then `*`. Host and rules are
+lowercased and every trailing dot is dropped. Each rule array is compiled
+once (cached in a WeakMap keyed by the array storage hands out) into maps
+of exact hosts and domain suffixes, so a lookup walks the host's labels
+(`a.b.example.com`, `b.example.com`, `example.com`, `com`) instead of the
+list ([match.js › covering](extension/match.js)). `lib.js` exposes
+`hostIsBlocked`, `coveringRule` and `exceptionFor` on top of it.
+
+`normalizeRule` stores each entry in canonical form: `normalizeDomain`
+(lowercase, trim, `http://` added so the URL parser can extract the host,
+which also turns IDN input into punycode, leading `www.` and trailing dot
+stripped, strict label pattern or bracketed IPv6) for domains, and the
+same without the `www.` strip for exact rules and exceptions, where
+dropping it would widen what the rule names (unsafe for an exception)
+([lib.js › normalizeRule](extension/lib.js)). `saveDomains` stores the
+list as one sorted, de-duplicated `chrome.storage.sync` item, and refuses
+a list larger than the sync per-item quota with a message the popup and
+options page show ([lib.js › saveDomains](extension/lib.js)).
+
+**Why not the obvious way.** A bare `endsWith(d)` would match
+`evilexample.com`, and a trailing-dot name (`example.com.`) would get past
+the list. A separate copy of the matcher in `arm.js` could drift from the
+background's. A loop over every rule per check costs more with
+every listed site; the label walk costs the same for one rule or
+thousands. Exceptions must beat `*` and parent domains, or the allowlist
+recipe would not work.
 
 ##### Per-tab badge
 
 `setBadge` shows `ON` on tabs whose URL (or pending URL, so it lights before
 the commit) is listed. It refreshes on `tabs.onUpdated`, `tabs.onActivated`
-and on list changes ([background.js:379-399](extension/background.js#L379-L399)).
+and on list changes ([background.js › setBadge](extension/background.js), [background.js › refreshAllBadges](extension/background.js)).
 
 The badge looks only at the tab's address
-([background.js:381-385](extension/background.js#L381-L385)). Blocking also
+([background.js › setBadge](extension/background.js)). Blocking also
 applies where it shows nothing: in a listed iframe on an unlisted page, and
 on a listed page that has turned itself into `about:blank` or a `blob:null`
 page.
@@ -1002,18 +1189,20 @@ page.
 ##### Small defensive details
 
 Every browser call that can fail on a decision path has a `.catch` with a
-default: `tabs.get` gives `null` (judged not listed), `getAllFrames` an
-empty map (the walk jumps to the top frame), `tabs.remove` and
-`setBadgeText` failures are ignored, and the startup `tabs.query` gives an
-empty list ([background.js:181-182](extension/background.js#L181-L182),
-[background.js:198-199](extension/background.js#L198-L199),
-[background.js:231](extension/background.js#L231),
-[background.js:384](extension/background.js#L384)). A decision therefore
+default: `tabs.get` gives `null` (judged not listed), `getAllFrames` gives
+`null` from `liveFrames` (a decision reads that as "no frames", so the walk
+jumps to the top frame, while pruning keeps the tab's rows), `tabs.remove`
+and `setBadgeText` failures are ignored, and the startup `tabs.query` gives
+an empty list ([background.js › liveFrames](extension/background.js),
+[background.js › frameWasListed](extension/background.js),
+[background.js › block](extension/background.js),
+[background.js › setBadge](extension/background.js)). A decision therefore
 settles, and `track()` cleans it up
-([background.js:171-179](extension/background.js#L171-L179)), instead of
+([background.js › track](extension/background.js)), instead of
 leaving a rejected promise that later popups would wait on. Message
 handlers check `msg?.type` and `sender.tab?.id`, and the menu `srcs` are
-checked to be strings ([background.js:353-358](extension/background.js#L353-L358)).
+checked to be strings
+([background.js › runtime.onMessage listener](extension/background.js)).
 
 ### In-page guard
 
@@ -1030,7 +1219,7 @@ it runs in, and each way of opening a tab it covers.
 on a listed site. That has to be decided from inside each frame, quickly,
 and without trusting the page.
 
-**What it does** ([arm.js:39-62](extension/arm.js#L39-L62)):
+**What it does** ([arm.js › check](extension/arm.js)):
 
 1. Check `self.origin` and `location.hostname`. Either one being listed
    arms the guard. A `blob:` or `about:blank` document inherits its
@@ -1049,29 +1238,29 @@ and without trusting the page.
 background layer still closes anything the page opens, so the in-page layer
 being skipped is not a hole. If the extension can't read the list in a
 frame (the storage read fails), `arm.js` sends neither signal
-([arm.js:64](extension/arm.js#L64)). The guard then stays installed but
+([arm.js › check](extension/arm.js)). The guard then stays installed but
 unarmed on that page: everything passes through, but its wrappers are not
 removed.
 
 Limits: a top-level page asks only if it still has `window.opener` when the
-list arrives ([arm.js:49](extension/arm.js#L49)). A cross-site popup opened
+list arrives ([arm.js › check](extension/arm.js)). A cross-site popup opened
 with `noopener`, or one that clears its own `opener` first, is treated as
 unlisted in the page. The background still closes it and anything it opens
 (`spawned`). The background's reply describes the tab (its URL, its
 top-frame history, whether it is a popup in flight), not the asking frame's
-own ancestors ([background.js:366-377](extension/background.js#L366-L377)).
+own ancestors ([background.js › runtime.onMessage listener](extension/background.js)).
 So frames under a listed iframe that is itself sandboxed (shown as `"null"`)
 inside an unlisted page are not guarded in the page. The background's frame
 walk still catches their popups.
 
 **Why not the obvious way.** `"null"` in `ancestorOrigins` means "hidden or
 opaque", not "unlisted". Asking the background for every page would slow
-every load and keep waking the worker. `arm.js` has its own copy of the host
-match ([arm.js:31-37](extension/arm.js#L31-L37)) because a manifest content
-script is a classic script: it cannot use a static `import`, and a dynamic
-one would need `lib.js` exposed as a web-accessible resource
-([manifest.json](extension/manifest.json) declares none) and an extra async
-step.
+every load and keep waking the worker. `arm.js` gets the host matcher from
+`match.js`, loaded as a classic content script just before it
+([match.js](extension/match.js)): a manifest content script cannot use a
+static `import`, and a dynamic one would need `lib.js` exposed as a
+web-accessible resource ([manifest.json](extension/manifest.json) declares
+none) and an extra async step.
 
 ##### Secret handshake: only `arm.js` can arm or remove the guard
 
@@ -1083,12 +1272,12 @@ dispatched by content scripts are untrusted too.
 **What it does.** `arm.js` builds a secret from
 `crypto.getRandomValues(new Uint32Array(4))` in base 36, and dispatches
 `__no_new_tabs_hello__` with that secret as `detail`, synchronously at
-`document_start` ([arm.js:14-19](extension/arm.js#L14-L19)). `guard.js`
+`document_start` ([arm.js › secret](extension/arm.js)). `guard.js`
 registered a `{ once: true }` listener and stores it with
 ``secret ??= `${e.detail}` ``, so only the first hello counts. Later
 `__no_new_tabs_arm__` and `__no_new_tabs_unlisted__` events count only if
 their `detail`, read with the saved `CustomEvent.prototype.detail` getter,
-equals the secret ([guard.js:114-128](extension/guard.js#L114-L128)).
+equals the secret ([guard.js › fromArmJs](extension/guard.js)).
 
 **Why not the obvious way.** Both scripts run before any page script, so no
 page listener exists to see the hello, and the secret never reaches page
@@ -1097,12 +1286,12 @@ exists in secure contexts. It is missing on plain-http sites, so the guard
 would never arm there. `localhost` counts as a secure context even over
 http, so a suite that only uses `localhost` would not notice; the tests map
 `*.test` to the local server to cover this
-([run.mjs:436-454](test/run.mjs#L436-L454)). The secret is a string
+([run.mjs › insecureSite](test/run.mjs)). The secret is a string
 because Chrome hands a `CustomEvent.detail` from the isolated world to the
 page's world only as a primitive: an object made in `arm.js` would show up
 as `null` in `guard.js`. The guard compares it by value, read through the
 saved `CustomEvent.prototype.detail` getter
-([guard.js:118-119](extension/guard.js#L118-L119)). Tests: "page fakes the
+([guard.js › detailGet](extension/guard.js)). Tests: "page fakes the
 'unlisted' signal", "page faked 'unlisted' during load", "page fakes 'arm',
 then opens".
 
@@ -1116,11 +1305,11 @@ secret, so a page listener could read it and replay it. A late
 "unlisted" (after the list changes) must not disarm a guarded page either.
 
 **What it does.** `onArm` only arms. `onUnlisted` acts only while not armed
-([guard.js:120-123](extension/guard.js#L120-L123)). On the `arm.js` side,
+([guard.js › onArm](extension/guard.js), [guard.js › onUnlisted](extension/guard.js)). On the `arm.js` side,
 `arm()` sends at most once and `unlisted()` never sends after arming
-([arm.js:21-29](extension/arm.js#L21-L29)). Removing a site from an open
+([arm.js › arm](extension/arm.js), [arm.js › unlisted](extension/arm.js)). Removing a site from an open
 page needs a reload, which is why the popup reloads the tab
-([popup.js:29-34](extension/popup.js#L29-L34)).
+([popup.js › render](extension/popup.js)).
 
 **Why not the obvious way.** A two-way switch would let a page that sniffed
 the secret disarm itself. With an arm-only switch, the worst a replay can do
@@ -1136,7 +1325,7 @@ answer.
 copy the page saves is already a guard wrapper. Each wrapper checks
 `state.armed` when it is called, not when it was made. Before arming it
 forwards everything to the native function unchanged
-([guard.js:381](extension/guard.js#L381)). After arming, the same saved
+([guard.js › guarded](extension/guard.js)). After arming, the same saved
 copies block.
 
 **Why not the obvious way.** Installing only after arming would be too
@@ -1153,14 +1342,14 @@ round trip) leaves a gap.
 **What it does.** At startup the guard reads `window.parent` and
 `window.opener`. If either is another window whose marker function returns
 exactly `true`, the guard starts armed
-([guard.js:104-112](extension/guard.js#L104-L112)). Cross-origin access
+([guard.js › MARK](extension/guard.js)). Cross-origin access
 throws and is caught; `arm.js` decides those cases.
 
 **Why not the obvious way.** This runs before any page script in the new
 window. The marker it reads lives on the parent or opener, where page
 scripts have already run, and it stays configurable until that window is
-armed ([guard.js:352](extension/guard.js#L352),
-[guard.js:415](extension/guard.js#L415)), so that page could redefine it.
+armed ([guard.js › mark](extension/guard.js),
+[guard.js › rec.lock](extension/guard.js)), so that page could redefine it.
 At worst that arms the guard early, or leaves the decision to `arm.js`.
 
 ##### Live arming without a reload
@@ -1169,11 +1358,14 @@ At worst that arms the guard early, or leaves the decision to `arm.js`.
 become guarded at once, including hidden frames that already exist, even
 before any user input.
 
-**What it does.** `arm.js` listens to `chrome.storage.onChanged` and checks
-again ([arm.js:66-68](extension/arm.js#L66-L68)). `guard.js`'s `arm()` sets
-`armed`, clears `removed`, reinstalls into the window if it had removed
-itself, locks `window.open` in every realm, and sweeps every same-origin
-child frame ([guard.js:175-181](extension/guard.js#L175-L181)).
+**What it does.** `arm.js` listens to `chrome.storage.sync.onChanged` (only
+the sync area, so the background's frequent session-storage writes do not
+wake every frame of every page) and checks again ([arm.js](extension/arm.js)).
+`guard.js`'s `arm()` sets `armed`, clears `removed`, reinstalls into the
+window if it had removed itself, locks `window.open` in every realm, sweeps
+every same-origin child frame, and tames the sandboxed iframes of every
+document it is installed in, adopted `javascript:` frames included, since
+those have no `arm.js` of their own ([guard.js › arm](extension/guard.js)).
 
 **Why not the obvious way.** Clearing `removed` is required because
 `install()` refuses to run while it is set. The sweep covers frames the page
@@ -1187,9 +1379,8 @@ functions. Copies of `window.open`, a frame's `open` or a prototype method
 that it saved in that time are not guarded after live arming. The reinstall
 also reads `window.Function`, `window.open`, `window.Document`,
 `window.MutationObserver` and the like from a page that may have replaced
-them ([guard.js:305-307](extension/guard.js#L305-L307),
-[guard.js:355](extension/guard.js#L355),
-[guard.js:373](extension/guard.js#L373)). For full in-page protection,
+them ([guard.js › install](extension/guard.js),
+[guard.js › nativeOpen](extension/guard.js)). For full in-page protection,
 reload the tab after adding a site. The background layer covers the rest.
 
 #### Hardening against a hostile page
@@ -1198,7 +1389,7 @@ reload the tab after adding a site. The background layer covers the rest.
 
 The guard's first statement returns unless `document.contentType` is HTML,
 XHTML, SVG or XML, the types that run script
-([guard.js:28-29](extension/guard.js#L28-L29)). It runs before any page
+([guard.js › document.contentType](extension/guard.js)). It runs before any page
 script, so `document.contentType` and `RegExp.prototype.test` are still the
 browser's own.
 
@@ -1215,7 +1406,7 @@ steered or broken.
 methods, the WeakMap/WeakSet/WeakRef methods, `add/removeEventListener`,
 the Node, Element, Document and Event methods and accessors, and the
 window accessors (`name`, `length`, `origin`, `frameElement`, `top`)
-([guard.js:36-99](extension/guard.js#L36-L99)). Array appends go through
+([guard.js › uncurry](extension/guard.js), and the constants after it). Array appends go through
 `defineProperty` instead of `Array.prototype.push`, and option and
 descriptor objects handed to the browser are copied to a null prototype,
 so poisoned `Object.prototype` or `Array.prototype` members are never
@@ -1225,10 +1416,13 @@ still read live, page-visible properties: `win.Function` at install and in
 `relisten` (with a fallback that matches the record by window when the
 page replaced `Function`), `win.MutationObserver` and its
 `observe`/`disconnect`, `win.DOMException` when refusing
-picture-in-picture, `el.contentWindow` for `<frame>` and `<object>`, and
-each realm's own `Range.prototype.startContainer` getter (never the
+picture-in-picture, and each realm's own `Range.prototype.startContainer` getter (never the
 `Node.prototype` property a page can shadow) when finding a `Range`'s
-window ([guard.js:571-581](extension/guard.js#L571-L581)). See
+window ([guard.js › viewOfTarget](extension/guard.js)). Frame windows are
+read through the saved native `contentWindow` getter of `<iframe>`,
+`<frame>` or `<object>`, chosen by tag, never through `el.contentWindow`,
+which a page can shadow with an own property on the element
+([guard.js › childWindow](extension/guard.js)). See
 [Known gaps](#known-gaps).
 
 **Why not the obvious way.** The capture only counts because it happens
@@ -1242,7 +1436,7 @@ time, and a page can replace it.
 
 **What it does.** `uncurry(f)` returns `(self, ...args) => apply(f, self, args)`,
 where `apply` is the saved `Reflect.apply`
-([guard.js:33-36](extension/guard.js#L33-L36)). Every saved method becomes a
+([guard.js › uncurry](extension/guard.js)). Every saved method becomes a
 plain function that takes the receiver first. Wrappers forward to natives
 the same way: `apply(native, this, args)`.
 
@@ -1259,14 +1453,14 @@ prototype.
 
 **What it does.** `getter(proto, key)` takes the native `get` function from
 the prototype at startup and uncurries it
-([guard.js:37](extension/guard.js#L37),
-[guard.js:49-75](extension/guard.js#L49-L75)). The guard calls
+([guard.js › getter](extension/guard.js),
+[guard.js › nodeType](extension/guard.js)). The guard calls
 `nodeType(n)`, `localName(el)`, `evType(e)`, `winName(w)` and so on, which
 run the browser's own getter whatever the page has defined on the object.
 
 **Why not the obvious way.** The test page redefines its own `window.name`
 as a getter that returns `'ghost'` and then calls `open(url, 'ghost')`
-([v14.html:39](test/site/v14.html#L39)). A plain `w.name` read would find
+([v14.html › j-ghost](test/site/v14.html)). A plain `w.name` read would find
 the page itself as a matching "frame" and let a new window open. Test:
 "fake window.name, then open into it".
 
@@ -1275,7 +1469,7 @@ the page itself as a matching "frame" and let a new window open. Test:
 A captured native getter throws "Illegal invocation" on the wrong kind of
 object, for example a plain `Event('click')` with no MouseEvent fields.
 `mouseKey()` wraps each MouseEvent getter in `try/catch` and returns
-`false`, or `0` for `button` ([guard.js:67-68](extension/guard.js#L67-L68)).
+`false`, or `0` for `button` ([guard.js › mouseKey](extension/guard.js)).
 `submitterOf`, `fromArmJs`, `viewOf`, `isElement` and `formOf` also catch.
 Otherwise a page could make the guard's listeners throw on purpose and skip
 the check that follows.
@@ -1292,21 +1486,21 @@ and `find()` are plain `for (i < length)` loops. `frameNamed` keeps a
 manual stack and `readArgs` fills a fresh array, but both write through
 `ownIndex()`, which defines own data properties instead of assigning, so
 a swallowing setter on `Array.prototype` cannot eat an index
-([guard.js:174-191](extension/guard.js#L174-L191),
-[guard.js:231-235](extension/guard.js#L231-L235)). Appends to the guard's
+([guard.js › frameNamed](extension/guard.js),
+[guard.js › readArgs](extension/guard.js)). Appends to the guard's
 own lists go through the same `defineProperty` path.
 
 **Why not the obvious way.** The rule is about when code runs, not about
 syntax. The startup block uses `.map`, destructuring and `for…of` because no
-page script has run yet ([guard.js:43-44](extension/guard.js#L43-L44),
-[guard.js:107](extension/guard.js#L107)). The same syntax in a wrapper body
+page script has run yet ([guard.js › winName](extension/guard.js),
+[guard.js › MARK](extension/guard.js)). The same syntax in a wrapper body
 would be unsafe.
 
 ##### Bound helpers and captured constructors
 
 `setTimeout`, `console.info` and `Promise.reject` are bound at startup, and
 the `WeakMap` and `WeakRef` constructors are saved
-([guard.js:76-82](extension/guard.js#L76-L82)). `install()` runs again much
+([guard.js › setTimer](extension/guard.js)). `install()` runs again much
 later for adopted frames and on live arming, and a bare `new WeakMap()` then
 would use whatever the page has put in `window.WeakMap`. A page that
 replaces `console.info` also cannot see or silence the guard's log.
@@ -1314,15 +1508,15 @@ replaces `console.info` also cannot see or silence the guard's log.
 ##### Capture as a boolean, not an options object
 
 `listen()` and the shadow-root listeners pass `true` as the third argument
-([guard.js:346](extension/guard.js#L346),
-[guard.js:669-671](extension/guard.js#L669-L671)). An options object such
+([guard.js › listen](extension/guard.js),
+[guard.js › install](extension/guard.js), the `attachShadow` wrapper). An options object such
 as `{ capture: true }` is read through `Object.prototype`, so a page could
 add `signal` (an aborted `AbortSignal`) or flip `capture` on every listener
 the guard adds later. The only options object left is the `{ once: true }`
-in `later()` ([guard.js:609](extension/guard.js#L609)), which is the
+in `later()` ([guard.js › later](extension/guard.js)), which is the
 `Object.prototype.signal`/`capture` gap listed under
 [Known gaps](#known-gaps). The hello listener's `{ once: true }`
-([guard.js:117](extension/guard.js#L117)) is safe because it is created
+([guard.js › secret](extension/guard.js)) is safe because it is created
 before any page script runs.
 
 ##### Strict mode and `this ?? win`
@@ -1334,8 +1528,8 @@ judge the target from the window the browser will open from.
 **What it does.** The guard is `"use strict"`, so a bare call leaves `this`
 undefined instead of the guard's own global. The wrapper uses
 `const self = this ?? win`, where `win` is the window it was installed into
-([guard.js:26](extension/guard.js#L26),
-[guard.js:379-386](extension/guard.js#L379-L386)).
+([guard.js › "use strict"](extension/guard.js),
+[guard.js › guarded](extension/guard.js)).
 
 **Why not the obvious way.** In sloppy mode a bare call would get the guard
 script's own global, which is the outer page when the guard adopted a
@@ -1353,12 +1547,12 @@ unpatched `window.open` elsewhere.
 (`{ open(...args) {} }.open`, `{ [key]() {} }[key]`) or an object-literal
 accessor. These get the right name, have no `prototype` and cannot be
 constructed, like native methods. `wrap()` also copies `name` and `length`
-from the native ([guard.js:96-102](extension/guard.js#L96-L102)). In each
+from the native ([guard.js › wrap](extension/guard.js)). In each
 realm, `Function.prototype.toString` is replaced with one that follows the
 `nativeOf` map (wrapper to native, to the end of the chain) and calls the
 realm's original `toString` on the native. It registers itself too, so
 `toString.toString()` looks native
-([guard.js:354-365](extension/guard.js#L354-L365)).
+([guard.js › nativeToString](extension/guard.js)).
 
 **Why not the obvious way.** A plain `function open(...args)` has a
 `prototype` and the wrong `length`. The spoof must be per realm, because
@@ -1371,14 +1565,14 @@ because the parent's guard creates them, so
 `Object.getPrototypeOf(frame.open) === frame.Function.prototype` and
 `frame.open instanceof frame.Function` are false, unlike the native. A
 blocked `requestWindow()` in a frame likewise returns the parent realm's
-`Promise` ([guard.js:82](extension/guard.js#L82),
-[guard.js:506](extension/guard.js#L506)). Test:
+`Promise` ([guard.js › rejectWith](extension/guard.js),
+[guard.js › install](extension/guard.js), the `requestWindow` wrapper). Test:
 "Function.prototype.toString looks native".
 
 ##### Rate-limited logging
 
 The guard logs the first 20 blocks, then one "further blocks on this page
-not logged" line, then nothing ([guard.js:89-94](extension/guard.js#L89-L94)).
+not logged" line, then nothing ([guard.js › log](extension/guard.js)).
 Some ad scripts retry many times a second. Link and form URLs are logged
 resolved against the document's base URL, the way the browser resolves
 them — not the raw attribute. Test: "console shows resolved URL".
@@ -1389,7 +1583,7 @@ them — not the raw attribute. Test: "console shows resolved URL".
 
 A blocked `window.open` or three-argument `document.open` logs and returns
 `null`, which is what the browser's popup blocker returns
-([guard.js:386-389](extension/guard.js#L386-L389)). Throwing, or returning a
+([guard.js › guarded](extension/guard.js)). Throwing, or returning a
 fake window, would break site code or tell ad scripts to try another route.
 Same-tab opens (`_self`, `_top`, `_parent`, a reachable named frame) go
 through unchanged.
@@ -1403,8 +1597,8 @@ browser converts it again.
 **What it does.** Once armed, `readArgs()` turns the first two arguments
 into strings once with a template literal, leaves `null` and `undefined`
 alone, and keeps the other arguments and the count unchanged. Those strings
-are both checked and passed on ([guard.js:203-209](extension/guard.js#L203-L209),
-[guard.js:382](extension/guard.js#L382)).
+are both checked and passed on ([guard.js › readArgs](extension/guard.js),
+[guard.js › guarded](extension/guard.js)).
 
 **Why not the obvious way.** Checking the original arguments and then
 forwarding them is a time-of-check/time-of-use gap. Converting everything,
@@ -1422,7 +1616,7 @@ anywhere, stops at 11 characters, and lowercases. It then checks for
 `about:` or `javascript:`. `window.open` and three-argument
 `document.open` block those URLs aimed in-tab (`_self`, `_top`,
 `_parent`), where they would run in place of the page
-([guard.js:253-260](extension/guard.js#L253-L260)). Aimed at a named frame
+([guard.js › blanksPage](extension/guard.js)). Aimed at a named frame
 that resolves, they go through: the frame resets instead of opening a
 tab, and a missing name still opens a new context (blocked as usual).
 
@@ -1439,15 +1633,14 @@ code and show that a guard is present on every site.
 **What it does.** Before arming, `window.open` is a data property with the
 native's attributes (writable, enumerable, configurable) holding the
 guarded wrapper. The native is read from the window's own descriptor, not
-through `win.open` ([guard.js:373](extension/guard.js#L373),
-[guard.js:402](extension/guard.js#L402)). Tests: "window.open was plain
+through `win.open` ([guard.js › nativeOpen](extension/guard.js)). Tests: "window.open was plain
 during load too", "window.open is a plain property again".
 
 ##### One stable wrapper per function
 
 `guarded(fn)` keeps one wrapper per underlying function in a WeakMap, so
 `window.open === window.open` holds and saved references compare equal
-([guard.js:374-394](extension/guard.js#L374-L394)). The WeakMap does not
+([guard.js › guarded](extension/guard.js)). The WeakMap does not
 keep page functions alive.
 
 ##### Once armed: a non-configurable accessor with a setter
@@ -1460,7 +1653,7 @@ non-configurable accessor. It takes the current value (from the data
 property, or by calling the page's own getter), unwraps it if it is one of
 the guard's wrappers, and stores it. The getter returns `guarded(value)`,
 and the setter just stores the new value
-([guard.js:403-417](extension/guard.js#L403-L417)). Being
+([guard.js › rec.lock](extension/guard.js)). Being
 non-configurable, the property can no longer be redefined or deleted.
 
 **Why not the obvious way.** A writable data property lets any assignment
@@ -1479,9 +1672,8 @@ frame.
 
 **What it does.** The getter calls `pageWritten(value)`, which returns
 every function except the native `open`s the guard itself saw at install
-time, in any realm ([guard.js:112](extension/guard.js#L112),
-[guard.js:511](extension/guard.js#L511),
-[guard.js:541](extension/guard.js#L541)). A page-written hook — bound, a
+time, in any realm ([guard.js › nativeOpens](extension/guard.js),
+[guard.js › pageWritten](extension/guard.js)). A page-written hook — bound, a
 proxy, or one whose source happens to mention `[native code]` — is returned
 unchanged, so `window.open === myHook` holds even after the tag manager
 reassigns it fifty times. Whatever native it calls is a guarded wrapper
@@ -1498,7 +1690,7 @@ window.open hook keeps identity".
 `document.open(url, name, features)` is an old alias for `window.open`. The
 wrapper blocks three-argument calls that open a new context or an inert URL,
 judged from the document's own window. Calls with fewer arguments replace
-the document and go through ([guard.js:419-433](extension/guard.js#L419-L433)).
+the document and go through ([guard.js › install](extension/guard.js), the `Document.prototype.open` wrapper).
 Only the argument count tells the two apart. Test: "document.open(3 args)".
 
 ##### Picture-in-picture windows are refused
@@ -1506,7 +1698,7 @@ Only the argument count tells the two apart. Test: "document.open(3 args)".
 `documentPictureInPicture.requestWindow()` opens an always-on-top window.
 When armed, the wrapper rejects with a `DOMException` `NotAllowedError` made
 from that realm's own `DOMException`
-([guard.js:501-510](extension/guard.js#L501-L510)). That looks like the
+([guard.js › install](extension/guard.js), the `requestWindow` wrapper). That looks like the
 browser's own refusal, so page code takes its usual error path. Tests:
 "listed: refused", "unlisted: not refused by us".
 
@@ -1526,7 +1718,7 @@ stays native. PopAds, Adcash and similar scripts use exactly this.
 **What it does.** These frames are same-origin with the parent, so the
 parent's guard installs into them through every adoption path below. Each
 adopted frame gets its own insertion wrappers, so a `javascript:false` frame
-inside another one is covered ([guard.js:245-268](extension/guard.js#L245-L268)).
+inside another one is covered ([guard.js › adopt](extension/guard.js)).
 
 **Why not the obvious way.** `match_origin_as_fallback` and `all_frames` do
 not help, because there is no committed document to inject into. Only the
@@ -1542,7 +1734,7 @@ outer page's elements: `frameForm.submit.call(outerForm)`.
 **What it does.** `install(win)` reads everything from the target window
 (`win.Function.prototype`, `win.Document.prototype`,
 `win.HTMLFormElement.prototype`, `win.MutationObserver`, …) and patches it
-([guard.js:335-739](extension/guard.js#L335-L739)). `state`, `nativeOf` and
+([guard.js › install](extension/guard.js)). `state`, `nativeOf` and
 the decision helpers are shared by all realms.
 
 **Why not the obvious way.** Patching only the top window leaves every
@@ -1558,20 +1750,20 @@ new realm and a new `Function`.
 
 **What it does.** `records` is a WeakMap from `win.Function` (the realm's own
 constructor) to `{ undo, lock, relisten }`
-([guard.js:272-283](extension/guard.js#L272-L283)). A new document in a new
+([guard.js › records](extension/guard.js)). A new document in a new
 realm has a new `Function`, so it is installed again. `win.Function` also
 throws for cross-origin windows, so `adopt()`'s `try/catch` skips those;
 they get their own `guard.js`. A list of WeakRefs (`realms`) makes the
 WeakMap iterable without keeping removed frames alive. Dead entries are
 skipped but not removed while the page is armed
-([guard.js:277-283](extension/guard.js#L277-L283)), so `realms` grows by
+([guard.js › forEachRecord](extension/guard.js)), so `realms` grows by
 one small WeakRef per adopted realm for the life of the page. Only
-`uninstallAll` clears it ([guard.js:291](extension/guard.js#L291)).
+`uninstallAll` clears it ([guard.js › uninstallAll](extension/guard.js)).
 
 The key is read as `win.Function`
-([guard.js:307](extension/guard.js#L307)), an ordinary writable global,
+([guard.js › install](extension/guard.js)), an ordinary writable global,
 just like the marker. (The code comment at
-[guard.js:272-273](extension/guard.js#L272-L273) says it can't be faked;
+[guard.js › records](extension/guard.js) says it can't be faked;
 that holds only because of when it is read.) What protects it is timing:
 it is read at `document_start` for the guard's own window, and during
 adoption for a child, before the page can reach it. A page that got hold of
@@ -1590,10 +1782,10 @@ one) must not both install into one window.
 
 **What it does.** `install()` defines `window.__noNewTabsGuard` as a
 function `() => state.armed`: non-enumerable, non-writable, configurable
-([guard.js:351-352](extension/guard.js#L351-L352)). Readers get the live
+([guard.js › mark](extension/guard.js)). Readers get the live
 state. `install()` skips a window that already has its own marker
-([guard.js:311](extension/guard.js#L311)). When armed, `rec.lock()` makes
-the marker non-configurable ([guard.js:415](extension/guard.js#L415)).
+([guard.js › install](extension/guard.js)). When armed, `rec.lock()` makes
+the marker non-configurable ([guard.js › rec.lock](extension/guard.js)).
 Readers check `other[MARK]?.() === true`, so only a real `true` counts.
 
 **Why not the obvious way.** A page can fake the marker. A fake that returns
@@ -1612,7 +1804,7 @@ real page loads.
 **What it does.** Inserting the frame (or reading `contentWindow`) adopts the
 `about:blank` realm at once. When `child.html` loads into the same realm,
 its own `guard.js` finds the marker and backs off, leaving the parent's
-patches ([guard.js:335-341](extension/guard.js#L335-L341)). The saved
+patches ([guard.js › install](extension/guard.js)). The saved
 wrapper resolves bare calls to the frame's own window (`this ?? win`).
 
 **Why not the obvious way.** Without the back-off, two guard copies would
@@ -1627,15 +1819,27 @@ on the very next line.
 
 **What it does.** `framesAfter` wraps every insertion method. It finds the
 window the node belongs to, reads that window's frame count with the native
-`length` getter, runs the native call, and in `finally` reads the count
-again. If it changed, it sweeps that window
-([guard.js:543-560](extension/guard.js#L543-L560)). The `finally` means a
-call that throws still gets its frames swept.
+`length` getter, runs the native call, and in `finally` hands the count
+before and after to `adoptAdded` ([guard.js › framesAfter](extension/guard.js),
+[guard.js › adoptAdded](extension/guard.js)). For every element argument,
+it adopts the element if it is a frame (`iframe`, `frame`, `object`,
+`embed`) and every frame nested inside it: a cheap `querySelector`
+existence test first, which says no for most inserted subtrees, then
+`querySelectorAll`. When armed, each inserted iframe also gets its sandbox
+tamed. It sweeps the whole window only when the count grew and there was
+no element argument (string HTML such as `innerHTML`, which can land
+anywhere, or a text node) or the count grew by more than the frames it
+found (a frame the call made some other way). The `finally` means a call
+that throws is still handled.
 
 **Why not the obvious way.** A MutationObserver runs as a microtask, after
 the inserting script has already read `contentWindow.open`. Only a
-synchronous wrapper closes that gap. Comparing `window.length` is cheap and
-needs no walk over the inserted subtree.
+synchronous wrapper closes that gap. Adopting just the argument would miss
+a frame nested in an inserted `<div>`, which the page can still reach
+through `frames[n]` without touching the element. Sweeping on every
+insertion would walk every frame of the page on every `appendChild`.
+Tests: "frame nested in an inserted div", "two frames at two depths in one
+insert".
 
 ##### Every insertion API, on each interface that owns it
 
@@ -1647,23 +1851,23 @@ wraps an explicit table: `Node` (`appendChild`, `insertBefore`,
 `insertAdjacentHTML`, `setHTMLUnsafe`); `CharacterData` and `DocumentType`
 (`before`, `after`, `replaceWith`); `Document` (`append`, `prepend`,
 `replaceChildren`); `ShadowRoot` (`setHTMLUnsafe`); `Range` (`insertNode`,
-`surroundContents`) ([guard.js:561-571](extension/guard.js#L561-L571)).
+`surroundContents`) ([guard.js › insertions](extension/guard.js)).
 `method()` skips a key that is not an own function, so a missing API is
-skipped without error ([guard.js:336-339](extension/guard.js#L336-L339)).
+skipped without error ([guard.js › method](extension/guard.js)).
 The `innerHTML` and `outerHTML` setters on `Element` and `ShadowRoot` are
-wrapped too ([guard.js:572-573](extension/guard.js#L572-L573));
+wrapped too;
 `ShadowRoot.innerHTML` is its own accessor, not inherited from `Element`.
 A sweep only finds frames through `window.length` and `win[i]`, which do
 not reach frames inside a shadow tree, so those are adopted by the
-`contentWindow` getter when the page reads it
-([guard.js:512-531](extension/guard.js#L512-L531)), not by an insertion
+`contentWindow` getter when the page reads it, not by an insertion
 wrapper.
 
 ##### Finding the window that gains the frame
 
-`viewOfTarget` maps a `Range` to its start container, a `Document` to its
+`viewOfTarget` maps a `Range` to its start container (asked only by the
+`Range` wrappers, through that realm's own getter), a `Document` to its
 own `defaultView`, and any other node to its owner document's window
-([guard.js:537-542](extension/guard.js#L537-L542)). A Document's
+([guard.js › viewOfTarget](extension/guard.js)). A Document's
 `ownerDocument` is `null`, so a naive lookup would miss
 `document.append(...)`. Inserting into a child frame's document must sweep
 that frame's window, not the top one.
@@ -1671,17 +1875,18 @@ that frame's window, not the top one.
 ##### A frame swapped for another one
 
 `replaceWith`, `replaceChild` or moving an iframe can leave the count the
-same while a new, unguarded window exists. If the count did not change and
-is above 0, `framesAfter` checks whether any argument is or contains a
-frame element, and sweeps anyway ([guard.js:553-557](extension/guard.js#L553-L557)).
-Re-adopting is safe because `install()` runs once per realm.
+same while a new, unguarded window exists. The frames among and inside the
+element arguments are adopted whatever the count says
+([guard.js › adoptAdded](extension/guard.js)). Re-adopting is safe because
+`install()` runs once per realm.
 
 ##### `contentWindow` and `contentDocument` adopt before handing over
 
 For `HTMLIFrameElement`, `HTMLFrameElement` and `HTMLObjectElement`, the
 `contentWindow` and `contentDocument` getters call the native getter, adopt
 the resulting window, and return the value unchanged
-([guard.js:512-531](extension/guard.js#L512-L531)). This is the one moment
+([guard.js › install](extension/guard.js), the `contentWindow` and
+`contentDocument` loop). This is the one moment
 the page is certain to get a reference, so guarding here cannot come too
 late. Test: "jsf iframe contentWindow.open".
 
@@ -1692,8 +1897,9 @@ An inline script right after an `<iframe>` tag can save `frames.name.open`.
 
 **What it does.** One MutationObserver per installed window, made from that
 realm's own constructor, watches the document. It ignores the records and
-only compares the frame count with the last count, sweeping on a change
-([guard.js:575-587](extension/guard.js#L575-L587)).
+only compares the frame count with the last count; on a change it sweeps
+and, when armed, tames the document's sandboxed iframes
+([guard.js › install](extension/guard.js), `observer`).
 
 **Why not the obvious way.** Parsing calls nothing that can be patched. The
 only hook is the microtask checkpoint the parser runs before each script.
@@ -1704,11 +1910,10 @@ parser-inserted frame. Test: "open saved from a frame, while parsing".
 
 A frame's window can change when its first document loads. A capture `load`
 listener on the document adopts the window of any frame element that
-finishes loading ([guard.js:588-596](extension/guard.js#L588-L596)). It has
+finishes loading, through `childWindow`'s native getters, and tames an
+iframe's sandbox first ([guard.js › install](extension/guard.js)). It has
 to be on the document in the capture phase: element `load` events do not
-bubble and never reach `Window` listeners. The saved `contentWindow` getter
-is for iframes only, so `<frame>` and `<object>` fall back to
-`el.contentWindow`, which is itself the adopting wrapper.
+bubble and never reach `Window` listeners.
 
 ##### Sweep before any input reaches page handlers
 
@@ -1717,7 +1922,7 @@ without touching the element, so no getter or insertion hook runs.
 
 **What it does.** Capture listeners on the window for `pointerdown`,
 `mousedown`, `pointerup`, `keydown`, `touchstart`, `touchend` and `click`
-sweep all frames when armed ([guard.js:677-682](extension/guard.js#L677-L682)).
+sweep all frames when armed ([guard.js › onInput](extension/guard.js)).
 They run before any page handler for that input.
 
 **Why not the obvious way.** A popup needs user activation, and a new frame
@@ -1730,7 +1935,7 @@ because it grants no activation.
 `adopt(win)` runs `install(win)` then `sweep(win)` inside one `try/catch`,
 so a cross-origin child is skipped. `sweep()` reads the count with the
 native getter and indexes `win[i]` inside `try`, recursing into
-grandchildren ([guard.js:252-268](extension/guard.js#L252-L268)).
+grandchildren ([guard.js › sweep](extension/guard.js)).
 
 ##### Listeners re-added after `document.open` and `write`
 
@@ -1741,13 +1946,13 @@ listeners `arm.js` signals through.
 
 **What it does.** `document.open`, `write` and `writeln` are wrapped. In a
 `finally` block the wrapper calls `relisten(this)` and `sweepFrom(this)`
-([guard.js:441-446](extension/guard.js#L441-L446)). `relisten` finds the
+([guard.js › install](extension/guard.js), the `write` wrapper). `relisten` finds the
 realm's record and re-adds every listener recorded by `listen()`, plus the
 control listeners for the guard's own window
-([guard.js:306-313](extension/guard.js#L306-L313)). `sweepFrom` adopts
+([guard.js › relisten](extension/guard.js)). `sweepFrom` adopts
 frames the written HTML created. Two rewrites the wrappers cannot cover
 are handled by observers, which survive `document.open()`: `arm.js`
-re-runs its menu reporting setup, and the guard puts its control
+re-adds its named menu listeners (`listenMenus`), and the guard puts its control
 listeners back even while uninstalled, so a rewritten unlisted page still
 hears a later arm signal. Tests: "menu reported after document.open()",
 "menu reported in rewritten iframe", "rewritten unlisted page arms when
@@ -1755,7 +1960,9 @@ listed".
 
 **Why not the obvious way.** `addEventListener` ignores a listener already
 registered with the same type, callback and capture, so calling `relisten`
-after every write does not register anything twice. Tests: "_blank after
+after every write does not register anything twice; the same holds for
+`arm.js` only because its listeners are the same function objects every
+time. Tests: "one menu report per menu after mutations", "_blank after
 document.open() of page", "_blank in frame written during/after load".
 `relisten` finds the record through `win.Function`, read at the time of
 the write, so a page that replaces `window.Function` first defeats it; see
@@ -1772,17 +1979,54 @@ stay inside the frame. `arm.js` finds the listed parent in
 A frame with `allow-same-origin` but without `allow-scripts` runs no script,
 so its own `guard.js` never runs. The parent page can still call its
 `window.open` or `form.submit`, and links inside it still work. The parent
-adopts it like any same-origin child ([guard.js:247-251](extension/guard.js#L247-L251)).
+adopts it like any same-origin child ([guard.js › adopt](extension/guard.js)).
 Tests: "no-script sandbox frame's window.open / form.submit", "_blank link
 in a no-script sandbox frame".
 
-A frame with neither `allow-scripts` nor `allow-same-origin` has an opaque
-origin: the parent can never adopt it and no script runs in it, so a
-`target=_blank` link inside it would flash a tab. On listed pages the guard
-takes `allow-popups` out of such a frame's `sandbox` attribute — at
-insertion, on load, when the page is armed, and when the attribute is set
-afterwards — so the click does nothing instead of flashing. Test: "opaque
-sandbox _blank click".
+##### Opaque sandboxed frames lose `allow-popups`
+
+**Problem.** A frame with neither `allow-scripts` nor `allow-same-origin`
+has an opaque origin: the parent can never adopt it and no script runs in
+it, so a `target=_blank` link inside it would flash a tab. A page can put
+`allow-popups` there in many ways: in markup, through the parser, before
+the page is armed, or after insertion through any of a dozen
+attribute-write routes.
+
+**What it does.** On listed pages `tameSandbox` takes `allow-popups` out of
+an iframe's `sandbox` attribute. When it actually strips something, it
+also navigates the frame again to what its attributes say (the same
+`srcdoc`, else the same `src`) ([guard.js › tameSandbox](extension/guard.js),
+[guard.js › renavigate](extension/guard.js)). It runs at script
+insertion (`adoptAdded`), when the observer sees the frame count change,
+on each frame's `load`, and at arming for every document the guard is
+installed in. After insertion, every write route re-tames the iframe
+once the write is done, from the value the browser stored:
+`setAttribute` (which also strips a plain string value up front),
+`setAttributeNS`, `setAttributeNode(NS)`, `toggleAttribute`,
+`attributes.setNamedItem(NS)`, the `sandbox` IDL setter, the `sandbox`
+DOMTokenList (`add`, `remove`, `toggle`, `replace`, `value`; removing
+`allow-scripts` can leave `allow-popups` on an opaque frame; the guard remembers which
+iframe each list came from), and the `Attr` node's `value`, `nodeValue` and
+`textContent` ([guard.js › tameAfter](extension/guard.js),
+[guard.js › tameList](extension/guard.js),
+[guard.js › tameAttr](extension/guard.js)).
+
+**Why not the obvious way.** Chromium takes a frame's sandbox flags when a
+navigation starts (for the first document, at insertion), so stripping the
+attribute of a frame already in the document only affects its next
+navigation: without the second load, the document already there keeps
+`allow-popups`. Checking the arguments of each write is not enough either:
+a name object whose `toString` answers one thing to the guard and
+`"sandbox"` to the browser, a namespace or an `Attr` node would split the
+two views, so the guard reads back what the browser stored. The extra
+load happens only when something was stripped. The routes on `Node`
+(`nodeValue`, `textContent`) and `DOMTokenList` cost every other call one
+`nodeType` read or one WeakMap lookup, within measurement noise
+([ARCHITECTURE.md](ARCHITECTURE.md)). Tests: "opaque sandbox _blank
+click", "markup-inserted opaque sandbox _blank click", "parser-inserted
+opaque sandbox _blank click", "opaque sandbox present before arming",
+"two-faced setAttribute escalation _blank click", and an "escalation via
+… stripped" check per write route.
 
 #### Links, forms and clicks
 
@@ -1793,7 +2037,7 @@ window) and middle-click all open new contexts. Downloads must still work.
 
 **What it does.** `onActivate` is a capture listener on the window for
 `click` and `auxclick`, so it runs before page handlers
-([guard.js:822-868](extension/guard.js#L822-L868)). It returns early if the
+([guard.js › onActivate](extension/guard.js)). It returns early if the
 event is already `defaultPrevented` (handled further out, which avoids
 double handling between window and shadow-root listeners). It takes the
 first link in the saved `composedPath`, so the innermost link wins. A link
@@ -1821,7 +2065,7 @@ cancelling up front would leave a dead click.
 **What it does.** `later()` adds a one-time non-capture listener for the
 same event type and decides there: if the target still opens a new context
 after the page's handlers ran, it cancels
-([guard.js:779-798](extension/guard.js#L779-L798)). `ev === e` ignores a
+([guard.js › later](extension/guard.js)). `ev === e` ignores a
 different event of the same type. A `setTimeout(0)` removes the listener if
 the page stopped propagation. The listener is added where the event can
 reach: the window for document events, the shadow root itself for events
@@ -1840,8 +2084,8 @@ target> set by a click handler`, `form target set by a submit handler`,
 
 A capture `submit` listener on the window computes the target from the
 submitter's `formtarget`, then the form's `target`, then `<base target>`
-([guard.js:224-227](extension/guard.js#L224-L227),
-[guard.js:869-878](extension/guard.js#L869-L878)). It never cancels at
+([guard.js › formTarget](extension/guard.js),
+[guard.js › onSubmit](extension/guard.js)). It never cancels at
 capture: like links, submits are decided in the late check, so a handler
 that switches the target back to `_self` still works. The submitter comes from
 the saved `SubmitEvent.prototype.submitter` getter, in `try/catch` so a
@@ -1851,8 +2095,8 @@ plain `new Event('submit')` cannot make it throw. `isSubmit` matches
 with a missing or invalid `type`, which default to submit, are included. The
 form comes from the native `form` getter of `HTMLButtonElement` or
 `HTMLInputElement`, which honours the `form=` attribute
-([guard.js:71-72](extension/guard.js#L71-L72),
-[guard.js:231-233](extension/guard.js#L231-L233)).
+([guard.js › buttonForm](extension/guard.js),
+[guard.js › formOf](extension/guard.js)).
 
 ##### Submit-button clicks
 
@@ -1872,10 +2116,10 @@ all `submit` events never leave a shadow root.
 **What it does.** `Element.prototype.attachShadow` is wrapped. After the
 native call it adds capture `click`, `auxclick` and `submit` listeners to
 the returned root, closed roots included, and records the root in
-`listenedRoots` ([guard.js:912-919](extension/guard.js#L912-L919)).
+`listenedRoots` ([guard.js › install](extension/guard.js), the `attachShadow` wrapper).
 `unheard(node)` is true when the node's root is neither its document nor a
 listened root, for example a detached node or a declarative shadow root
-built by the parser ([guard.js:590-593](extension/guard.js#L590-L593)).
+built by the parser ([guard.js › unheard](extension/guard.js)).
 
 **Why not the obvious way.** Declarative roots (`<template shadowrootmode>`)
 never call `attachShadow`, so they stay unheard. The `click()`,
@@ -1894,7 +2138,7 @@ never reaches the guard's listeners, but the browser still follows it.
 `EventTarget.prototype.dispatchEvent` are wrapped. They act only when the
 element is not connected or its root is unheard. Then they find the closest
 link, let downloads through (unless a modifier is set), and block if the
-target opens a new context ([guard.js:471-499](extension/guard.js#L471-L499)).
+target opens a new context ([guard.js › hiddenLinkOpensNew](extension/guard.js)).
 For dispatched `click` or `auxclick` events, Ctrl, Meta, Shift or
 `button === 1` also count, and a block returns `false`, as for a cancelled
 event. Connected elements in heard trees go to the native call, so the
@@ -1903,13 +2147,13 @@ listeners stay the single source of truth.
 ##### `form.submit()` and `requestSubmit()`
 
 `form.submit()` fires no submit event, so its wrapper checks the form's
-target directly, in every realm ([guard.js:448-456](extension/guard.js#L448-L456)).
+target directly, in every realm ([guard.js › install](extension/guard.js), the `submit` wrapper).
 `requestSubmit()` runs validation and a real submit event that the page's
 handlers rely on, so its wrapper never blocks: it first makes sure the submit is heard
 (adding a listener inside a shadow root the browser built, which the parser
 never sent through `attachShadow`), then runs the native call, and
 `onSubmit` cancels the navigation late if it still opens a new context
-([guard.js:618-627](extension/guard.js#L618-L627)). A submit-button click
+([guard.js › ensureSubmitHeard](extension/guard.js)). A submit-button click
 takes the same road: it only ensures the submit is heard and leaves the
 click alone.
 Test: "requestSubmit runs the site's submit handler" (exactly once, and no
@@ -1918,10 +2162,10 @@ tab).
 ##### Link targets, SVG links and `<area>`
 
 `linkTarget` is `target`, else the first `<base target>` in the document
-([guard.js:213-223](extension/guard.js#L213-L223)). It uses `??`, so a
+([guard.js › linkTarget](extension/guard.js)). It uses `??`, so a
 present but empty `target=""` stays `_self` and does not fall through to
 `<base>`. `isLink` matches `a[href], area[href]`, or an `<a>` with
-`xlink:href` ([guard.js:228-230](extension/guard.js#L228-L230));
+`xlink:href` ([guard.js › isLink](extension/guard.js));
 `xlink:href` is namespaced and `[href]` does not match it.
 
 #### Target-name rules
@@ -1936,9 +2180,9 @@ disagree with the browser. `" _self"` is a new window named `" _self"`, and
 links, empty is `_self`). Case-insensitive `_self`, `_parent` and `_top` do
 not open anything. Any other name starting with `_` (`_blank`, `_new`, …)
 does. Any other name opens a new window unless `frameNamed` finds a frame
-the caller can navigate ([guard.js:175-184](extension/guard.js#L175-L184)).
+the caller can navigate ([guard.js › opensNew](extension/guard.js)).
 For `window.open`, a missing or empty name means `_blank`
-([guard.js:201-202](extension/guard.js#L201-L202)). `toLower` is the saved
+([guard.js › openTarget](extension/guard.js)). `toLower` is the saved
 `String.prototype.toLowerCase`.
 
 **Why not the obvious way.** Trimming makes `" _self"` look like a same-tab
@@ -1960,7 +2204,7 @@ windows. When no readable window matches, it matches `name` attributes on
 `<iframe>` and `<frame>` elements in the same documents it could read: a
 frame showing another site has no readable `window.name`, but Chrome still
 navigates it instead of opening a tab
-([guard.js:194-229](extension/guard.js#L194-L229)). `isSandboxed`
+([guard.js › frameNamed](extension/guard.js)). `isSandboxed`
 treats origin `"null"` or a `sandbox` attribute on the frame element as
 sandboxed.
 
@@ -1974,18 +2218,18 @@ frame's window.open into it", "named iframe showing another site".
 
 When the guard cannot tell where a named target leads, it treats it as a
 new window. If the caller's window can't be read, a name counts as new
-([guard.js:183](extension/guard.js#L183),
-[guard.js:384-386](extension/guard.js#L384-L386)). If its top window can't
-be read, no frame matches ([guard.js:150](extension/guard.js#L150)). A frame
+([guard.js › opensNew](extension/guard.js),
+[guard.js › guarded](extension/guard.js)). If its top window can't
+be read, no frame matches ([guard.js › frameNamed](extension/guard.js)). A frame
 whose name throws (another origin) never matches
-([guard.js:155](extension/guard.js#L155)). The worst case is a same-tab
+([guard.js › frameNamed](extension/guard.js)). The worst case is a same-tab
 open being refused, never a new tab getting through.
 
 ##### Dangling-markup targets
 
 A link or form target that contains a tab, CR or LF together with `<` is
 treated by browsers as `_blank` (a dangling-markup defence). `cleanTarget`
-does the same ([guard.js:217-222](extension/guard.js#L217-L222)).
+does the same ([guard.js › cleanTarget](extension/guard.js)).
 
 #### Removal on unlisted sites
 
@@ -2000,16 +2244,16 @@ step for each property it replaces, `listen()` adds a
 `removeEventListener`, and the observer adds `disconnect()`.
 `uninstallAll()` runs each realm's list from last to first, each step in its
 own `try/catch`, then forgets the realm
-([guard.js:462-488](extension/guard.js#L462-L488),
-[guard.js:418-424](extension/guard.js#L418-L424)).
+([guard.js › uninstallAll](extension/guard.js),
+[guard.js › patch](extension/guard.js)).
 
 Exception: shadow roots the page attached before the guard was removed keep
 the guard's capture `click`, `auxclick` and `submit` listeners. The
 `attachShadow` wrapper adds them directly, not through `listen()`
-([guard.js:912-919](extension/guard.js#L912-L919)), so they are not on the
+([guard.js › install](extension/guard.js), the `attachShadow` wrapper), so they are not on the
 undo list. They do nothing while the guard is not armed (`onActivate` and
-`onSubmit` return at once, [guard.js:847-848](extension/guard.js#L847-L848),
-[guard.js:894-895](extension/guard.js#L894-L895)) and work again if the site is added
+`onSubmit` return at once, [guard.js › onActivate](extension/guard.js),
+[guard.js › onSubmit](extension/guard.js)) and work again if the site is added
 later.
 
 **Why not the obvious way.** A guard that is merely disabled and left in
@@ -2020,16 +2264,16 @@ and accessors (`appendChild`, `append`, `insertAdjacentHTML`, `write`,
 `open`, `click`, `dispatchEvent`, `attachShadow`, `submit`,
 `requestSubmit`, the `innerHTML` setter and the `contentWindow` getter) is
 native again, `window.open` is a data property and the marker is gone
-([run.mjs:380-421](test/run.mjs#L380-L421)).
+([run.mjs › unlistedIsUntouched](test/run.mjs)).
 
 ##### Undo restores only if the slot is still the guard's
 
 `patch()` saves the previous descriptor. Its undo step restores it only if
 the current `value`, `get` and `set` are all the ones the guard installed,
 and deletes the property if there was none before
-([guard.js:324-334](extension/guard.js#L324-L334)). A page that assigned its
+([guard.js › patch](extension/guard.js)). A page that assigned its
 own `window.open` during load keeps it after removal. That follows from the
-check at [guard.js:329](extension/guard.js#L329) but is not tested: the test
+check at [guard.js › patch](extension/guard.js) but is not tested: the test
 "assigned window.open is the same object" assigns only after removal.
 
 ##### `state.removed` stops saved wrappers from reinstalling the guard
@@ -2038,9 +2282,9 @@ After removal, the page may still hold wrappers it saved during load, such
 as `Node.prototype.appendChild`. Calling one sweeps frames, which would call
 `install()` again. `uninstallAll()` sets `state.removed` first, and
 `install()` returns at once while it is set. Only `arm()` clears it
-([guard.js:84-85](extension/guard.js#L84-L85),
-[guard.js:286](extension/guard.js#L286),
-[guard.js:306](extension/guard.js#L306)). Test: "a saved wrapper doesn't
+([guard.js › state](extension/guard.js),
+[guard.js › uninstallAll](extension/guard.js),
+[guard.js › install](extension/guard.js)). Test: "a saved wrapper doesn't
 bring it back".
 
 The control listeners are never put on the undo list, so a page that was
@@ -2048,26 +2292,33 @@ found unlisted can still be armed later when its site is added.
 
 ### Popup and options page
 
-- **Toggle removes the covering entry.** On `app.example.com` covered by
-  `example.com`, the popup says "(via example.com)" and the button removes
-  `example.com` ([popup.js:17-28](extension/popup.js#L17-L28)).
-- **Reload after a toggle,** because arming is one-way and a removal needs a
-  fresh document ([popup.js:29-34](extension/popup.js#L29-L34)).
+- **One button that flips the current site.** `siteToggle` works out what
+  lists the host: the rule naming this site (offer to remove it), a broader
+  rule such as a parent domain or `*` (offer the exception `!site`, and
+  show "via …"), or exceptions that keep it unlisted (offer to remove
+  them); otherwise it offers to add the site
+  ([lib.js › siteToggle](extension/lib.js)). Removing `example.com` from
+  `app.example.com` would unlist every sibling too, so a broader rule is
+  never removed from a subdomain's popup.
+- **Reload after a change,** because arming is one-way and a removal needs
+  a fresh document ([popup.js › render](extension/popup.js)). A save that
+  fails (the quota) shows "Not saved: …" and leaves the tab alone.
 - **Non-web pages get no button.** `new URL("chrome://newtab").hostname` is
-  `newtab`, which would add junk ([popup.js:5-15](extension/popup.js#L5-L15)).
-- **`innerHTML` only gets normalised host names,** which match a strict
-  pattern, so the status line is not an injection sink
-  ([popup.js:23-25](extension/popup.js#L23-L25)).
+  `newtab`, which would add junk; only `httpUrl` addresses get one.
+- **Text only.** The status line and the error list are built with
+  `textContent` and `replaceChildren`, never `innerHTML`: rules and lines
+  are user input.
 - **Lenient input, strict storage.** The options page splits on newlines
-  and commas, normalises, drops junk, de-duplicates and sorts, then shows
-  back what was actually saved, so silent drops are visible
-  ([options.js:9-17](extension/options.js#L9-L17),
-  [lib.js:53-57](extension/lib.js#L53-L57)).
+  and commas, normalises each line, drops junk, de-duplicates and sorts,
+  then shows back what was actually saved and lists the lines it dropped
+  ([lib.js › rejectedLines](extension/lib.js),
+  [options.js › save](extension/options.js)). When the save is refused
+  (the quota), the textarea keeps what you typed.
 - **"Current domain" is the most recently used other web tab,** because the
-  options page is itself the active tab
-  ([options.js:19-25](extension/options.js#L19-L25)). "Add current" saves
-  the textarea's current lines plus the domain, so unsaved edits are kept
-  ([options.js:27-34](extension/options.js#L27-L34)).
+  options page is itself the active tab. The button decides with the
+  popup's `siteToggle` from the textarea's lines at the moment of the
+  click, so unsaved edits are kept, and it is hidden when the list already
+  blocks that site ([options.js › offerCurrent](extension/options.js)).
 
 ### Testing techniques
 
@@ -2078,7 +2329,7 @@ the background closes that tab first, the opener page, which shares the
 renderer process, can freeze mid-click. [cdp.mjs](test/cdp.mjs) talks to the
 DevTools WebSocket directly, auto-attaches only to iframes, and records page
 targets with created and destroyed times
-([cdp.mjs:1-5](test/cdp.mjs#L1-L5), [cdp.mjs:53-58](test/cdp.mjs#L53-L58)).
+([cdp.mjs › launchRaw](test/cdp.mjs), [cdp.mjs › pagesSince](test/cdp.mjs)).
 Playwright drives the full extension, where no tab is ever created. The raw
 driver covers the background-only layer, tab-under, cold worker, context
 menu and popup chain runs.
@@ -2087,15 +2338,15 @@ menu and popup chain runs.
 
 Chrome launches with `--remote-debugging-port=0` and a fresh profile. The
 driver reads the chosen port from `<profile>/DevToolsActivePort`
-([cdp.mjs:18-32](test/cdp.mjs#L18-L32)). Port 0 cannot collide with another
+([cdp.mjs › launchRaw](test/cdp.mjs)). Port 0 cannot collide with another
 browser or a parallel run.
 
 #### Timeouts everywhere
 
 Every CDP call races a 10 s timer, and each case runs under 15 s. In
 Playwright mode a stuck case closes all pages and continues
-([cdp.mjs:46-50](test/cdp.mjs#L46-L50),
-[run.mjs:222-236](test/run.mjs#L222-L236)). Tests of tab-killing code are
+([cdp.mjs › within](test/cdp.mjs),
+[run.mjs › openCase](test/run.mjs), [run.mjs › rawCase](test/run.mjs)). Tests of tab-killing code are
 the ones most likely to hang.
 
 #### Real, trusted input
@@ -2103,19 +2354,19 @@ the ones most likely to hang.
 `clickAt` sends `Input.dispatchMouseEvent` move, press and release with a
 modifier bitmask and button masks. `click()` scrolls the element to the
 centre and waits before measuring it
-([cdp.mjs:161-178](test/cdp.mjs#L161-L178)). Synthetic DOM events are
+([cdp.mjs › clickAt](test/cdp.mjs)). Synthetic DOM events are
 untrusted and grant no user activation, so they would not exercise the
-popup blocker or `arm.js`'s `isTrusted` checks on context-menu, `mousedown`
-and `keydown` events ([arm.js:79](extension/arm.js#L79),
-[arm.js:97](extension/arm.js#L97)). `clickIn` adds the frame's
+popup blocker or `arm.js`'s `isTrusted` checks on context-menu, `pointerdown`
+and `keydown` events ([arm.js › onContextMenu](extension/arm.js),
+[arm.js › onPointerDown](extension/arm.js), [arm.js › onKeyDown](extension/arm.js)). `clickIn` adds the frame's
 border (`clientLeft`, `clientTop`) when clicking inside an iframe
-([cdp.mjs:182-195](test/cdp.mjs#L182-L195)).
+([cdp.mjs › clickIn](test/cdp.mjs)).
 
 #### Running code in cross-origin frames with a user gesture
 
 The driver tracks execution contexts per out-of-process iframe session and
 evaluates in the right frame with `userGesture: true`
-([cdp.mjs:198-212](test/cdp.mjs#L198-L212)). Without the gesture, the popup
+([cdp.mjs › frameEval](test/cdp.mjs)). Without the gesture, the popup
 blocker would stop `window.open` and the test would pass even without the
 extension.
 
@@ -2123,9 +2374,9 @@ extension.
 
 Chrome's built-in extensions can also have a `background.js` worker.
 `swTarget` asks each one for its manifest name and keeps "No New Tabs"
-([cdp.mjs:82-95](test/cdp.mjs#L82-L95)). `stopSW` closes the worker target
+([cdp.mjs › swTarget](test/cdp.mjs)). `stopSW` closes the worker target
 to simulate Chrome's 30 s idle stop, and `wakeSW` opens and closes a
-background tab to restart it ([cdp.mjs:110-122](test/cdp.mjs#L110-L122)).
+background tab to restart it ([cdp.mjs › stopSW](test/cdp.mjs), [cdp.mjs › wakeSW](test/cdp.mjs)).
 Waiting 30 s per case is impractical, and a worker that is always warm hides
 bugs in saving and restoring state.
 
@@ -2134,10 +2385,10 @@ bugs in saving and restoring state.
 `localhost` is a secure context even over http, so APIs missing on real
 plain-http sites are present there. The Playwright browser launches with
 `--host-resolver-rules=MAP *.test 127.0.0.1`
-([run.mjs:28-30](test/run.mjs#L28-L30),
-[run.mjs:184](test/run.mjs#L184)); the raw-CDP browser does not need it.
+([run.mjs › HOSTS](test/run.mjs),
+[run.mjs › launch](test/run.mjs)); the raw-CDP browser does not need it.
 `insecureSite()` checks `listed.test` and `plain.test` with
-`!isSecureContext` ([run.mjs:436-454](test/run.mjs#L436-L454)). No DNS or hosts-file changes
+`!isSecureContext` ([run.mjs › insecureSite](test/run.mjs)). No DNS or hosts-file changes
 are needed.
 
 #### One server, two origins
@@ -2146,14 +2397,14 @@ The same server is reached as `http://localhost:PORT` (listed) and
 `http://127.0.0.1:PORT` (unlisted). Pages frame "the other host", so the
 control run also tests a listed frame inside an unlisted page: cases named
 "cross-origin …" must be blocked in both runs
-([run.mjs:25-27](test/run.mjs#L25-L27),
-[run.mjs:259-272](test/run.mjs#L259-L272)).
+([run.mjs › LISTED](test/run.mjs), [run.mjs › UNLISTED](test/run.mjs),
+[run.mjs › openCase](test/run.mjs)).
 
 #### The "no flash" standard
 
 In full-extension mode a case passes only if no tab was created at all,
 not just closed, and the page is still on its starting URL (unless the case
-leaves on purpose) ([run.mjs:259-272](test/run.mjs#L259-L272)). Checking
+leaves on purpose) ([run.mjs › openCase](test/run.mjs)). Checking
 only survivors would pass even if every case relied on the background.
 
 #### Background-only mode
@@ -2161,21 +2412,21 @@ only survivors would pass even if every case relied on the background.
 `backgroundOnlyCopy()` copies the extension and deletes `content_scripts`
 from the manifest, then the whole case table runs through the raw driver,
 plus user tabs, tab-under, cold worker, listed frame in an unlisted page and
-the popup chain ([run.mjs:54-63](test/run.mjs#L54-L63),
-[run.mjs:758-768](test/run.mjs#L758-L768)).
+the popup chain ([run.mjs › backgroundOnlyCopy](test/run.mjs),
+[run.mjs › STEPS](test/run.mjs)).
 
 #### Popup blocker off where it would hide the result
 
 `liveArmNoInput` and `popupChain` run with `--disable-popup-blocking`
-([run.mjs:755-768](test/run.mjs#L755-L768)). Otherwise a pass would only
+([run.mjs › ensureSetup](test/run.mjs)). Otherwise a pass would only
 reflect Chrome's own blocker.
 
 #### Stable coordinates
 
 The loaders wait for both cross-origin frames, for `document.fonts.ready`
 (text reflows when fonts arrive), and 150 ms for `arm.js` to read the list
-([run.mjs:212-220](test/run.mjs#L212-L220),
-[run.mjs:553-561](test/run.mjs#L553-L561)). A click that lands on nothing
+([run.mjs › loadStart](test/run.mjs),
+[run.mjs › rawLoad](test/run.mjs)). A click that lands on nothing
 makes a blocking test pass for the wrong reason.
 
 ### Ad-script tricks seen in the wild and how each is defeated
@@ -2187,38 +2438,38 @@ says otherwise.
 
 | Trick | How it is defeated | Test |
 | --- | --- | --- |
-| Plain `window.open(url)`, `window.open('')`, popup features | Guarded `open` returns `null`; empty name means `_blank` ([guard.js:375-394](extension/guard.js#L375-L394), [guard.js:201-202](extension/guard.js#L201-L202)) | "window.open()", "window.open('')", "popup window" |
-| Save `window.open` at load, call later | Guard is installed before any page script, so the saved copy is the wrapper ([guard.js:402](extension/guard.js#L402)) | "window.open saved at load" |
-| `document.open(url, name, features)` | Three-argument calls are checked like `window.open` ([guard.js:422-433](extension/guard.js#L422-L433)) | "document.open(3 args)" |
-| Hidden `<iframe src="javascript:false">`, then `frame.contentWindow.open` | `contentWindow` getter and insertion wrappers adopt the frame first ([guard.js:512-571](extension/guard.js#L512-L571)) | "jsf iframe contentWindow.open" |
-| PopAds minipop: `frames[n].open('about:blank', realUrlAsName, 'popup=1,width=5,height=5')`, then a script in the popup redirects to `name` | Input-time sweep adopts frames reached by index; the MutationObserver adopts parser-made frames; escaped popups are closed and marked `spawned` ([guard.js:575-587](extension/guard.js#L575-L587), [guard.js:677-682](extension/guard.js#L677-L682)) | "PopAds minipop (popup, about:blank)" |
-| PopAds: keep the iframe's `contentWindow` from load time | `insertBefore`/`append` adopt before the reference can be saved ([guard.js:561-571](extension/guard.js#L561-L571)) | "PopAds saved contentWindow" |
+| Plain `window.open(url)`, `window.open('')`, popup features | Guarded `open` returns `null`; empty name means `_blank` ([guard.js › guarded](extension/guard.js), [guard.js › openTarget](extension/guard.js)) | "window.open()", "window.open('')", "popup window" |
+| Save `window.open` at load, call later | Guard is installed before any page script, so the saved copy is the wrapper ([guard.js › nativeOpen](extension/guard.js)) | "window.open saved at load" |
+| `document.open(url, name, features)` | Three-argument calls are checked like `window.open` ([guard.js › install](extension/guard.js), the `Document.prototype.open` wrapper) | "document.open(3 args)" |
+| Hidden `<iframe src="javascript:false">`, then `frame.contentWindow.open` | `contentWindow` getter and insertion wrappers adopt the frame first ([guard.js › framesAfter](extension/guard.js), [guard.js › install](extension/guard.js), the `contentWindow` getter) | "jsf iframe contentWindow.open" |
+| PopAds minipop: `frames[n].open('about:blank', realUrlAsName, 'popup=1,width=5,height=5')`, then a script in the popup redirects to `name` | Input-time sweep adopts frames reached by index; the MutationObserver adopts parser-made frames; escaped popups are closed and marked `spawned` ([guard.js › observer](extension/guard.js), [guard.js › onInput](extension/guard.js)) | "PopAds minipop (popup, about:blank)" |
+| PopAds: keep the iframe's `contentWindow` from load time | `insertBefore`/`append` adopt before the reference can be saved ([guard.js › framesAfter](extension/guard.js)) | "PopAds saved contentWindow" |
 | Adcash: `frame.open.bind(frame)` | The function bound is already the guarded wrapper | "Adcash bound iframe open" |
-| Call the frame's `open` on the main window: `savedOpen.call(window, url)` | Wrapper judges from `this ?? win` and checks `state.armed` at call time ([guard.js:379-386](extension/guard.js#L379-L386)) | "iframe open saved, .call(window)" |
-| `window.open = iframe.contentWindow.open` | Locked accessor returns `guarded(value)` for any native ([guard.js:403-417](extension/guard.js#L403-L417)) | "window.open = iframe's open" |
+| Call the frame's `open` on the main window: `savedOpen.call(window, url)` | Wrapper judges from `this ?? win` and checks `state.armed` at call time ([guard.js › guarded](extension/guard.js)) | "iframe open saved, .call(window)" |
+| `window.open = iframe.contentWindow.open` | Locked accessor returns `guarded(value)` for any native ([guard.js › rec.lock](extension/guard.js)) | "window.open = iframe's open" |
 | Before input, make a hidden frame's native `open` the page's `window.open` | Parser-inserted frames are adopted before the next script; accessor guards natives | "window.open = frame's native, at load" |
-| Plant a fake `__noNewTabsGuard` marker on a frame so the guard skips it | Adoption runs first: the MutationObserver adopts parser-inserted frames before the next script ([guard.js:575-587](extension/guard.js#L575-L587)), so the guard's own marker is already in place and a marker planted later changes nothing ([guard.js:335-341](extension/guard.js#L335-L341)) | "frame pre-marked as guarded" |
-| `frames[name].open` on a frame made with `document.write` | `write` wrappers sweep afterwards; observer catches parser insertion ([guard.js:434-438](extension/guard.js#L434-L438)) | "frames[name].open, document.write" |
-| `javascript:false` frame inside a closed shadow root (out of reach of `frames[n]`) | The `contentWindow` getter adopts the frame when the page reads it ([guard.js:512-531](extension/guard.js#L512-L531)) | "shadow-root jsf iframe" |
+| Plant a fake `__noNewTabsGuard` marker on a frame so the guard skips it | Adoption runs first: the MutationObserver adopts parser-inserted frames before the next script ([guard.js › observer](extension/guard.js)), so the guard's own marker is already in place and a marker planted later changes nothing ([guard.js › install](extension/guard.js)) | "frame pre-marked as guarded" |
+| `frames[name].open` on a frame made with `document.write` | `write` wrappers sweep afterwards; observer catches parser insertion ([guard.js › install](extension/guard.js), the `write` wrapper) | "frames[name].open, document.write" |
+| `javascript:false` frame inside a closed shadow root (out of reach of `frames[n]`) | The `contentWindow` getter adopts the frame when the page reads it ([guard.js › install](extension/guard.js), the `contentWindow` getter) | "shadow-root jsf iframe" |
 | `javascript:false` frame inside another one | `sweep()` recurses; each adopted realm wraps its own insertion methods | "nested jsf iframe" |
 | Save a frame's `open` while the page is still parsing | MutationObserver runs before the next parser-inserted script | "open saved from a frame, while parsing" |
 | Save a `src` frame's `open` from its initial `about:blank`, which Chrome reuses for the real document | Frame adopted on insert; its own guard backs off on the marker | "open saved before the frame loaded" |
-| Detached `<a target=_blank>` plus `.click()` or `dispatchEvent` | `click`/`dispatchEvent` wrappers check unseen links ([guard.js:471-499](extension/guard.js#L471-L499)) | "detached link .click()", "detached link dispatchEvent" |
-| `frames.x.HTMLFormElement.prototype.submit.call(mainForm)` | Every adopted realm's `submit` is wrapped ([guard.js:448-456](extension/guard.js#L448-L456)) | "form.submit from iframe realm" |
-| `open('about:blank', '_self')` to blank the page | `inertUrl` blocks `about:` and `javascript:` in any target ([guard.js:186-200](extension/guard.js#L186-L200)) | "open('about:blank', '_self') blocked" |
+| Detached `<a target=_blank>` plus `.click()` or `dispatchEvent` | `click`/`dispatchEvent` wrappers check unseen links ([guard.js › hiddenLinkOpensNew](extension/guard.js)) | "detached link .click()", "detached link dispatchEvent" |
+| `frames.x.HTMLFormElement.prototype.submit.call(mainForm)` | Every adopted realm's `submit` is wrapped ([guard.js › install](extension/guard.js), the `submit` wrapper) | "form.submit from iframe realm" |
+| `open('about:blank', '_self')` to blank the page | `inertUrl` blocks `about:` and `javascript:` in any target ([guard.js › inertUrl](extension/guard.js)) | "open('about:blank', '_self') blocked" |
 | Tab-under: open, then move the listed tab away (`location`, `history.back()`, six redirects) or `window.close()` it | Background judges the opener at the moment of creation from recorded history; closed tabs remembered 30 s | "hidden-frame open, then leave", "… 6 redirects", "… history.back()", "… window.close()" |
-| Listed iframe opens, then navigates away or is removed | Recorded parents and `left` times; walk the tree as it was ([background.js:184-214](extension/background.js#L184-L214)) | "listed iframe: open, then the frame leaves / is removed" |
-| Popup that opens another popup from its load script | `spawned` set and pending verdicts ([background.js:218-226](extension/background.js#L218-L226)); with the full extension, `arm.js` in the popup is also told "listed" (untested) | "both windows closed" |
-| Ask whether `window.open` is wrapped (`toString`, `name`, `length`) | Per-realm `toString` spoof; shorthand wrappers with copied `name`/`length` ([guard.js:354-365](extension/guard.js#L354-L365)) | "Function.prototype.toString looks native" |
+| Listed iframe opens, then navigates away or is removed | Recorded parents and `left` times; walk the tree as it was ([background.js › frameWasListed](extension/background.js)) | "listed iframe: open, then the frame leaves / is removed" |
+| Popup that opens another popup from its load script | `spawned` set and pending verdicts ([background.js › wasListed](extension/background.js)); with the full extension, `arm.js` in the popup is also told "listed" (untested) | "both windows closed" |
+| Ask whether `window.open` is wrapped (`toString`, `name`, `length`) | Per-realm `toString` spoof; shorthand wrappers with copied `name`/`length` ([guard.js › nativeToString](extension/guard.js)) | "Function.prototype.toString looks native" |
 | Replace `Set.prototype.has`, `Function.prototype.apply`, `composedPath`, iterators | Built-ins saved at startup, called through `Reflect.apply`, index loops only | (relied on throughout) |
 | Retry `window.open` many times a second | Logging stops after 20 lines | (none) |
 | `open(url, ' _self')`, `open(url, '   ')` | Untrimmed, browser-style name matching | "open(url, ' _self')", "open(url, '   ')" |
-| Redefine `window.name` with a getter, then open "into" it | Native `name` getter ([guard.js:155](extension/guard.js#L155)) | "fake window.name, then open into it" |
+| Redefine `window.name` with a getter, then open "into" it | Native `name` getter ([guard.js › frameNamed](extension/guard.js)) | "fake window.name, then open into it" |
 | Sandboxed frame targets a sibling by name | Sandboxed callers search only their own subtree | "sandboxed frame opens into a sibling" |
 | Page handler sets `target=_blank` or `<base target=_blank>` after the guard looked | `later()` looks again after the page's handlers | `target set by a page click handler`, `<base target> set by a click handler`, `form target set by a submit handler` |
 | Links and forms in closed or declarative shadow roots, non-composed clicks | Listeners inside each `attachShadow` root; `unheard()` paths for declarative roots | "closed shadow root _blank link", "_blank form, declarative shadow root", ".click() in closed declarative shadow" |
 | `document.open()` the whole page, then a `_blank` link | Listeners re-added after `open`/`write` | "_blank after document.open() of page" |
-| Turn the page into a `blob:` copy, or a `blob:null` page via a sandboxed frame | `arm.js` checks `self.origin` (blob: copy) or asks the background for an opaque page (blob:null); the background inherits the previous site ([arm.js:42-50](extension/arm.js#L42-L50), [background.js:278-282](extension/background.js#L278-L282)) | "page turns itself into a blob: copy", "page becomes a blob:null page" |
+| Turn the page into a `blob:` copy, or a `blob:null` page via a sandboxed frame | `arm.js` checks `self.origin` (blob: copy) or asks the background for an opaque page (blob:null); the background inherits the previous site ([arm.js › check](extension/arm.js), [background.js › USER_TRANSITIONS](extension/background.js)) | "page turns itself into a blob: copy", "page becomes a blob:null page" |
 | `_blank` links in a `data:` frame | Injected via `match_origin_as_fallback`; `ancestorOrigins` | "_blank link in a data: frame" |
 | Use a no-script sandboxed frame's `open` or `form.submit` | Parent adopts it when readable; opaque frames get `allow-popups` stripped instead | "no-script sandbox frame's window.open", "… form.submit" |
 | Fake the guard's `unlisted` or `arm` signals | Secret handshake; arm-only | "page fakes the 'unlisted' signal", "page faked 'unlisted' during load", "page fakes 'arm', then opens" |
@@ -2235,8 +2486,8 @@ handled. Items marked "from reading the code" are not covered by tests.
 
 - **Right-click, Open link in new tab / new window** on a listed site is
   closed, like any other way the site's links open a tab. That includes a
-  link inside a closed shadow root. A tab chosen from the menu more than 5
-  minutes after the right-click is closed too.
+  link inside a closed shadow root. A tab chosen from the menu more than 30
+  seconds after the right-click is closed too.
 - **Right-click, Open image in new tab** on an image with a `data:`
   address is closed: the menu record skips `data:` addresses (a photo
   inlined as base64 would blow the session-storage quota on its own), so
@@ -2264,11 +2515,18 @@ handled. Items marked "from reading the code" are not covered by tests.
 In these cases the in-page guard misses the open, and the background closes
 the new tab a moment later.
 
-- **Opaque script-less frames missed by the `allow-popups` strip.** The
-  strip runs at insertion, on load, and when the page sets the attribute —
-  but only once armed, so an opaque frame put in place before the arm
-  signal (or inside a subdocument at arm time) keeps `allow-popups`. A
-  real click there flashes a tab that the background then closes.
+- **Opaque script-less frames before their second load.** Stripping
+  `allow-popups` takes effect only for the document the guard's
+  re-navigation loads, so a click in the frame's first document before
+  that load can still open a tab. A parser-inserted frame always commits
+  its first document before any script can strip it, so its end-to-end
+  check ("parser-inserted opaque sandbox _blank click") asserts what is
+  guaranteed, the stripped attribute and no surviving tab, and reports
+  how many tabs flashed. The background closes the tab.
+- **Shadow-root markup.** An opaque `allow-popups` iframe written with
+  `shadowRoot.innerHTML` is not stripped: the markup pass queries the
+  document, which does not reach into shadow roots (a gap that predates
+  the sandbox fixes). The background closes the tab.
 - **Brief flashes** are still possible when the page:
   - exhausts the stack just before the guard's saved calls. The guard's
     listeners fail closed when they run at all, but under exhaustion the
@@ -2280,7 +2538,8 @@ the new tab a moment later.
     trip.
 - **Page code that runs inside a DOM insertion** (a custom element's
   `connectedCallback`, an inserted `<script>`) can still reach a new frame's
-  `window.open` before the guard does.
+  `window.open` before the guard does, for example a `<script>` inserted
+  in the same call as a `javascript:false` iframe (from reading the code).
 - **Another extension's in-page UI frames.** Password managers and grammar
   checkers inject `chrome-extension://` iframes where the guard can't run.
   On a listed page, a tab opened from such a frame with a real click is
@@ -2299,17 +2558,17 @@ the new tab a moment later.
   are still cancelled up front, so they are not affected.
 - **A page capture listener could stop the arm signal** (from reading the
   code). The guard's control listeners are not capture listeners
-  ([guard.js:159-162](extension/guard.js#L159-L162)), so a page listener on
+  ([guard.js › listenControl](extension/guard.js)), so a page listener on
   `window` for `__no_new_tabs_arm__` that calls `stopImmediatePropagation()`
   could keep the guard from arming.
 - **Live arming of a page that was first found unlisted** (from reading the
   code). Natives the page saved while the guard was removed stay unguarded,
   and the reinstall reads globals the page may have replaced
-  ([guard.js:442-448](extension/guard.js#L442-L448)). Reloading the tab
+  ([guard.js › install](extension/guard.js)). Reloading the tab
   after adding a site avoids this.
 - **Sandboxed frames the guard can't recognise as sandboxed** (from reading
   the code). `isSandboxed` checks only the frame's own origin and its own
-  `sandbox` attribute ([guard.js:231-237](extension/guard.js#L231-L237)). A
+  `sandbox` attribute ([guard.js › isSandboxed](extension/guard.js)). A
   frame sandboxed with `allow-same-origin` inside a cross-origin parent
   (where `frameElement` is null), or a frame nested inside such a sandbox,
   can name a sibling frame in `open()` and get past the in-page guard. The
@@ -2336,11 +2595,13 @@ them.
   though you chose them:
   - (Brave only) "Search for …" on text selected inside a PDF. Brave records
     the PDF viewer's frames like normal frames, so the PDF rule
-    ([background.js:583-590](extension/background.js#L583-L590)) never
+    ([background.js › fromUserMenu](extension/background.js)) never
     fires.
+- **Rules from a newer version on an older one.** An older copy of this
+  extension on another synced device never matches `*`, `=` or `!` rules,
+  and if it saves the list, it drops them from sync for every device.
 - **Test coverage.** Menu-chosen tabs are kept and the fakes are refused
   ("menu search/image tab is kept", "second tab from one menu is closed",
-  "synthetic contextmenu is not recorded"). The
-  history-pruning code (the 60 s `left` expiry and the 1000-entry cap,
-  [background.js:286-311](extension/background.js#L286-L311)) has no direct
-  test either.
+  "synthetic contextmenu is not recorded"). The history pruning (the 60 s
+  `left` expiry, dead-frame pruning, the 1000-entry cap) is covered by
+  unit tests through the fake `chrome` API, not by the browser suite.

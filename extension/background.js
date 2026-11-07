@@ -3,7 +3,8 @@
 // (guard.js + arm.js stop most attempts before a tab exists; this catches
 // whatever gets past them.)
 
-import { hostIsBlocked, isBlockedUrl, loadDomains, siteOf } from "./lib.js";
+import { hostIsBlocked, httpUrl, isBlockedUrl, loadDomains, siteOf } from "./lib.js";
+import { offeredByMenu, SEARCH } from "./menu-match.js";
 
 // Kept in memory so closing a tab doesn't wait on a storage read.
 let domainsCache = null;
@@ -50,6 +51,17 @@ const gone = new Map(); // tabId -> when it was closed
 // restored page is current if any recorded frame of that page was listed.
 const restoredTabs = new Set(); // tabId
 
+// Tabs whose history starts with a tabs.query seed (no saved rows, e.g.
+// after an extension reload cleared session storage). Moments before the
+// first top-frame commit seen for them are unknown, so popups from that
+// window are taken as listed. Memory-only: never persisted.
+const unknownTabs = new Set();
+
+// Per-tab state owned by forgetGone (born/firstCommit/commitWaiters/
+// decisions clean themselves up by timer). Declared after every set it
+// lists: a reference above one of them would throw at worker start.
+const PER_TAB = [history, menus, gone, spawned, trimmed, restoredTabs, unknownTabs];
+
 // left: when the frame's page was left (a later top-frame commit).
 const pack = (entries) => entries.map(({ f, p, h, t, left }) => [f, p, h, t, left ?? 0]);
 const unpack = (rows) => rows.map(([f, p, h, t, left]) => ({ f, p, h, t, seq: 0, ...(left ? { left } : {}) }));
@@ -63,23 +75,15 @@ const restored = chrome.storage.session.get(null)
     for (const [id, m] of Object.entries(saved.menus ?? {})) if (!menus.has(+id)) menus.set(+id, m);
     for (const [id, at] of Object.entries(saved.gone ?? {})) if (!gone.has(+id)) gone.set(+id, at);
     // Saved entries predate everything this worker has seen (seq 0).
-    // Per-tab keys from this format, plus the old single key once when an
-    // older version wrote it.
+    // Rows live under per-tab keys h.<id>.
     for (const [key, value] of Object.entries(saved)) {
       const m = /^h\.(\d+)$/.exec(key);
       if (m) history.set(+m[1], [...unpack(value?.rows ?? []), ...(history.get(+m[1]) ?? [])]);
     }
-    if (saved.history && typeof saved.history === "object") {
-      dropLegacyHistory = true;
-      for (const [id, rows] of Object.entries(saved.history)) {
-        history.set(+id, [...unpack(rows), ...(history.get(+id) ?? [])]);
-        touchTab(+id);
-      }
-    }
   })
   .catch(() => {})
   .then(async () => {
-    let changed = dropLegacyHistory;
+    let changed = false;
     // Tabs open before the extension started have no saved history: start
     // it with what they show now.
     for (const tab of await chrome.tabs.query({}).catch(() => [])) {
@@ -94,7 +98,12 @@ const restored = chrome.storage.session.get(null)
         changed = true;
       }
     }
-    if (forgetGone().length) changed = true;
+    // Tabs closed over 30 s ago: forget them, and mark them dirty so
+    // save() removes their saved rows too (save's own forgetGone() will
+    // find nothing left to forget).
+    const forgotten = forgetGone();
+    forgotten.forEach(touchTab);
+    if (forgotten.length) changed = true;
     if (changed) persist();
   });
 
@@ -107,7 +116,6 @@ const PERSIST_DEBOUNCE_MS = 150;
 const hkey = (id) => `h.${id}`;
 const dirtyTabs = new Set(); // tab ids whose rows still need saving
 let globalsDirty = true; // spawned/trimmed/menus/gone/restoredTabs need saving
-let dropLegacyHistory = false; // old single-key format seen at restore
 const touchTab = (id) => { dirtyTabs.add(id); };
 const touchGlobals = () => { globalsDirty = true; };
 
@@ -135,7 +143,7 @@ async function save() {
     await pruneDead();
     const forgotten = forgetGone();
     for (const id of forgotten) dirtyTabs.delete(id);
-    const removals = [...forgotten.map(hkey), ...(dropLegacyHistory ? ["history"] : [])];
+    const removals = forgotten.map(hkey);
     const patch = {};
     if (globalsDirty) {
       patch.spawned = [...spawned].slice(-500);
@@ -151,7 +159,6 @@ async function save() {
     }
     dirtyTabs.clear();
     globalsDirty = false;
-    dropLegacyHistory = false;
     if (!Object.keys(patch).length && !removals.length) return;
     const write = ++writes;
     if (removals.length) await chrome.storage.session.remove(removals).catch(() => {});
@@ -161,6 +168,11 @@ async function save() {
       console.warn("[no-new-tabs] could not save history:", e?.message);
       if (write === writes) {
         chrome.storage.session.remove([...history.keys()].map(hkey).concat(["trimmed", "restoredTabs"])).catch(() => {});
+        // Everything removed above must be written again by the next save
+        // (the next event schedules it), or a trimmed tab, say, would lose
+        // its fail-closed flag across a worker restart.
+        for (const id of history.keys()) touchTab(id);
+        touchGlobals();
       }
     });
   } finally {
@@ -183,8 +195,8 @@ async function pruneDead() {
   lastPrune = now;
   for (const [id, entries] of history) {
     if (entries.length < PRUNE_MIN_ENTRIES) continue;
-    const live = await liveFrames(id).catch(() => null);
-    if (!live) continue;
+    const live = await liveFrames(id);
+    if (!live) continue; // frames unknown (closed or invalid tab): keep its rows
     const before = entries.length;
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i];
@@ -200,10 +212,7 @@ function forgetGone() {
   const forgotten = [];
   for (const [id, at] of gone) {
     if (now - at < 30_000) continue;
-    for (const m of [history, menus, gone]) m.delete(id);
-    spawned.delete(id);
-    trimmed.delete(id);
-    restoredTabs.delete(id);
+    for (const c of PER_TAB) c.delete(id);
     forgotten.push(id);
   }
   if (forgotten.length) touchGlobals();
@@ -240,17 +249,22 @@ function waitForFirstCommit(tabId) {
   return promise;
 }
 
-const isHttpUrl = (url) => {
-  try {
-    const p = new URL(url).protocol;
-    return p === "http:" || p === "https:";
-  } catch {
-    return false;
+// Keep a tab's rows within MAX_ENTRIES. The oldest subframe entry goes
+// first. Top-frame entries go last, and only after 1000 changes of site:
+// then what the tab showed before is unknown, so it is taken to be listed.
+function capHistory(tabId, list) {
+  let capped = false;
+  while (list.length > MAX_ENTRIES) {
+    const sub = list.findIndex((e) => e.f !== 0);
+    list.splice(Math.max(sub, 0), 1);
+    if (sub < 0) { trimmed.add(tabId); capped = true; }
   }
-};
+  if (capped) touchGlobals();
+}
 
 chrome.webNavigation.onCommitted.addListener((d) => {
   if (d.documentLifecycle === "prerender") return;
+  const backForward = d.frameId === 0 && (d.transitionQualifiers ?? []).includes("forward_back");
   if (d.frameId === 0) {
     // History from here on is observed, so the unknown window is over.
     unknownTabs.delete(d.tabId);
@@ -264,8 +278,7 @@ chrome.webNavigation.onCommitted.addListener((d) => {
     }
     const waiter = commitWaiters.get(d.tabId);
     if (waiter) waiter.resolve({ transitionType: d.transitionType });
-    const restoredNow = (d.transitionQualifiers ?? []).includes("forward_back");
-    if (restoredNow) {
+    if (backForward) {
       if (!restoredTabs.has(d.tabId)) {
         restoredTabs.add(d.tabId);
         touchGlobals();
@@ -287,6 +300,7 @@ chrome.webNavigation.onCommitted.addListener((d) => {
   }
   history.set(d.tabId, entries);
   const now = ++seq;
+  let stamped = false;
   if (d.frameId === 0) {
     // A new page: the frames of the one before have left with it. Frames of
     // pages left over a minute ago can't open anything now.
@@ -294,29 +308,28 @@ chrome.webNavigation.onCommitted.addListener((d) => {
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i];
       if (e.f === 0) continue;
-      if (e.left == null) e.left = d.timeStamp;
-      else if (e.left < old) entries.splice(i, 1);
+      if (e.left == null) { e.left = d.timeStamp; stamped = true; }
+      else if (e.left < old) { entries.splice(i, 1); stamped = true; }
     }
+    // Saved even when the commit itself records nothing new (a same-site
+    // top navigation): the stored rows must match these, or a restore
+    // brings the frames back as never left.
+    if (stamped) touchTab(d.tabId);
   }
   const last = lastOf(entries, d.frameId);
   if (last && last.h === h && last.p === parent && last.left == null) {
-    if (d.frameId !== 0 || !(d.transitionQualifiers ?? []).includes("forward_back")) return;
+    if (!backForward) {
+      if (stamped) persist();
+      return;
+    }
     // A cache restore with no visible change still needs its live subframes.
   } else {
     entries.push({ f: d.frameId, p: parent, h, t: d.timeStamp, seq: now });
-    let capped = false;
-    if (entries.length > MAX_ENTRIES) {
-      // Drop the oldest frame entry. Top-frame entries go last, and only
-      // after 1000 changes of site.
-      const sub = entries.findIndex((e) => e.f !== 0);
-      entries.splice(Math.max(sub, 0), 1);
-      if (sub < 0) { trimmed.add(d.tabId); capped = true; }
-    }
+    capHistory(d.tabId, entries);
     touchTab(d.tabId);
-    if (capped) touchGlobals();
   }
   persist();
-  if (d.frameId === 0 && (d.transitionQualifiers ?? []).includes("forward_back")) {
+  if (backForward) {
     // Subframes restored from the back/forward cache never re-commit, so
     // record what is live now for the no-source fallback below.
     const tabId = d.tabId;
@@ -335,14 +348,8 @@ chrome.webNavigation.onCommitted.addListener((d) => {
         changed = true;
       }
       if (changed) {
-        let capped = false;
-        while (list.length > MAX_ENTRIES) {
-          const sub = list.findIndex((e) => e.f !== 0);
-          list.splice(Math.max(sub, 0), 1);
-          if (sub < 0) { trimmed.add(tabId); capped = true; }
-        }
+        capHistory(tabId, list);
         touchTab(tabId);
-        if (capped) touchGlobals();
         persist();
       }
     }).catch(() => {});
@@ -380,21 +387,20 @@ function track(tabId, decision) {
   });
 }
 
-const liveFrames = async (tabId) => new Map(((await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null)) ?? [])
-  .map((x) => [x.frameId, x]));
+// The tab's frames now, by frame id; null when they cannot be read (a
+// closed or invalid tab). Decision paths read null as "no frames"; pruning
+// keeps that tab's rows.
+const liveFrames = async (tabId) => {
+  const all = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null);
+  return all ? new Map(all.map((x) => [x.frameId, x])) : null;
+};
 
 // Was this frame (or any frame above it) on a listed site at the given
 // moment? Frames that left or were removed since are judged by what they
-// were then.
-// Tabs whose history starts with a tabs.query seed (no saved rows, e.g.
-// after an extension reload cleared session storage). Moments before the
-// first top-frame commit seen for them are unknown, so popups from that
-// window are taken as listed. Memory-only: never persisted.
-const unknownTabs = new Set();
-
-async function frameWasListed(tabId, frameId, moment, domains) {
+// were then. `look` shares one getAllFrames snapshot across the calls of a
+// single decision (see openerWasListed).
+async function frameWasListed(tabId, frameId, moment, domains, look = {}) {
   const entries = history.get(tabId) ?? [];
-  let live = null;
   for (let f = frameId ?? 0, hops = 0; hops < 32; hops++) {
     if (f === 0 && unknownTabs.has(tabId)) return true;
     const e = entryAt(entries, f, moment);
@@ -409,8 +415,8 @@ async function frameWasListed(tabId, frameId, moment, domains) {
     } else {
       // A frame that never committed a document of its own (an about:blank
       // made by script, say): walk up from where it sits now.
-      live ??= await liveFrames(tabId);
-      const now = live.get(f);
+      look.live ??= (await liveFrames(tabId)) ?? new Map();
+      const now = look.live.get(f);
       if (!now) { f = 0; continue; } // gone without a trace: it was in this tab's page at least
       host = siteOf(now.url);
       parent = now.parentFrameId;
@@ -443,15 +449,15 @@ async function openerWasListed(openerTabId, moment, domains) {
   if (!restoredTabs.has(openerTabId)) return false;
   const entries = history.get(openerTabId) ?? [];
   const frames = new Set(entries.map((e) => e.f));
+  const look = {}; // one getAllFrames snapshot for the whole loop
   for (const f of frames) {
-    if (await frameWasListed(openerTabId, f, moment, domains)) return true;
+    if (await frameWasListed(openerTabId, f, moment, domains, look)) return true;
   }
-  // The refresh after a cache restore may still be in flight: look live.
-  try {
-    for (const [, f] of await liveFrames(openerTabId)) {
-      if (f.frameId !== 0 && hostIsBlocked(siteOf(f.url), domains)) return true;
-    }
-  } catch {}
+  // The refresh after a cache restore may still be in flight: look live
+  // again, on a fresh snapshot.
+  for (const [, f] of (await liveFrames(openerTabId)) ?? []) {
+    if (f.frameId !== 0 && hostIsBlocked(siteOf(f.url), domains)) return true;
+  }
   return false;
 }
 
@@ -500,64 +506,7 @@ function waitForNavSource(tabId) {
 // already has an address with a synthetic click, so the record is only
 // trusted with the checks in arm.js: a word-long selection, loaded and
 // unlinked images, and no synthetic activation of its own after the menu.
-const squash = (s) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
-// Brave's "Go to <address>" opens the selection itself, which has no query
-// string for the search rule to match. Accept the tab when its host and
-// path equal the selection parsed as a URL, with http:// added to bare
-// hosts. The comparison is exact (not contains) and case-insensitive, so a
-// selection of "example.com/a" never matches "example.com.evil/b".
-function urlFromSelection(sel) {
-  const t = String(sel ?? "").trim();
-  if (!t || t.length < 3 || t.length > 500) return null;
-  if (/\s/.test(t)) return null; // "Go to" offers a single address token
-  let cand = t;
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(cand)) {
-    const bare = cand.match(/^([\w-]+(?:\.[\w-]+)*)(:\d+)?(\/\S*)?$/u);
-    // A bare word with no dot, port or path is a search term, not an
-    // address ("hello"); with one of those it is ("localhost:8799/x").
-    if (!bare || (!bare[1].includes(".") && !bare[2] && !(bare[3] && bare[3].length > 1))) return null;
-    cand = `http://${cand}`;
-  }
-  try {
-    const u = new URL(cand);
-    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    return u;
-  } catch {
-    return null;
-  }
-}
-function goToMatch(selection, url) {
-  const selUrl = urlFromSelection(selection);
-  if (!selUrl) return false;
-  let tabUrl;
-  try {
-    tabUrl = new URL(url);
-  } catch {
-    return false;
-  }
-  if (tabUrl.protocol !== "http:" && tabUrl.protocol !== "https:") return false;
-  const normHost = (h) => h.toLowerCase().replace(/\.$/, "");
-  if (normHost(selUrl.hostname) !== normHost(tabUrl.hostname)) return false;
-  const normPort = (u) => (!u.port || u.port === "80" || u.port === "443" ? "" : u.port);
-  if (normPort(selUrl) !== normPort(tabUrl)) return false;
-  const normPath = (u) => {
-    let p = u.pathname || "/";
-    if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
-    return (p + u.search + u.hash).toLowerCase();
-  };
-  return normPath(selUrl) === normPath(tabUrl);
-}
-function offeredByMenu(menu, url) {
-  if (menu.srcs.includes(url)) return true;
-  if (goToMatch(menu.selection, url)) return true;
-  const words = squash(menu.selection).slice(0, 50);
-  if (words.length < 3) return false;
-  try {
-    for (const value of new URL(url).searchParams.values()) if (squash(value).includes(words)) return true;
-  } catch {}
-  return false;
-}
-
+// What the menu offered is matched in menu-match.js.
 // A synthetic activation the page dispatched itself may still be in
 // flight when the menu matches: give it a beat, then re-check the record
 // before trusting it.
@@ -585,10 +534,9 @@ async function fromUserMenu(tabId, sourceTabId, sourceFrameId, domains, navUrl) 
   // count, so the most a page could get from this is a search.
   if (sourceFrameId && SEARCH.test(url) && !isBlockedUrl(url, domains) &&
     !(history.get(sourceTabId) ?? []).some((e) => e.f === sourceFrameId) &&
-    !(await liveFrames(sourceTabId)).has(sourceFrameId)) return true;
+    !(await liveFrames(sourceTabId))?.has(sourceFrameId)) return true;
   return false;
 }
-const SEARCH = /^https:\/\/(www\.)?(google\.[a-z]{2,3}(\.[a-z]{2})?\/search|bing\.com\/search|duckduckgo\.com\/|search\.brave\.com\/search|search\.yahoo\.com\/search|(www\.)?ecosia\.org\/search|(www\.)?startpage\.com\/|yandex\.[a-z]{2,3}\/search|(www\.)?baidu\.com\/s|(www\.)?qwant\.com\/|kagi\.com\/search)\?/;
 
 function decideFromNav(details, atSeq) {
   return (async () => {
@@ -616,7 +564,7 @@ chrome.tabs.onCreated.addListener((tab) => {
   if (decisions.has(tab.id)) return; // navigation event came first
   const bornUrl = tab.pendingUrl || tab.url;
   const urlBorn = tab.openerTabId != null && !!bornUrl;
-  if (!pageCreated(tab) && !(urlBorn && isHttpUrl(bornUrl))) return;
+  if (!pageCreated(tab) && !(urlBorn && httpUrl(bornUrl))) return;
   const nav = waitForNavSource(tab.id); // register synchronously, before any await
   track(tab.id, (async () => {
     const source = await nav;

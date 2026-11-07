@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>parser-inserted sandboxed frame</title>
+<script>
+  // When the guard re-navigated the frame after stripping allow-popups
+  // (observer, arm time or load), and when the frame last loaded: the
+  // stripped flags only apply to the document that navigation loads, so
+  // the test waits for a load after it.
+  new MutationObserver((records) => {
+    for (const r of records) if (r.attributeName === "src") window.__renavAt = performance.now();
+  }).observe(document, { subtree: true, attributes: true, attributeFilter: ["src"] });
+  document.addEventListener("load", (e) => {
+    if (e.target.id === "p-opaque") window.__pLoad = performance.now();
+  }, true);
+</script>
+<!-- The parser inserts this frame without any DOM call the guard wraps, and
+     its sandbox value never goes through setAttribute or the IDL setter:
+     only the guard's observer, load listener and arm-time pass can strip
+     allow-popups from it. -->
+<iframe id="p-opaque" sandbox="allow-popups allow-forms" src="/opaque.html"></iframe>
+<p>A parser-inserted opaque frame that asks for allow-popups.</p>

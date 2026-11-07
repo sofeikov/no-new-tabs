@@ -1,16 +1,19 @@
 {
   "name": "no-new-tabs-tests",
   "version": "1.0.0",
-  "description": "End-to-end tests for the No New Tabs extension",
-  "main": "index.js",
-  "scripts": {
-    "test": "node run.mjs"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "description": "Unit and end-to-end tests for the No New Tabs extension",
+  "private": true,
   "type": "module",
-  "private": "true",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "npm run test:unit && npm run test:parallel",
+    "test:unit": "node --test unit*.mjs",
+    "test:e2e": "node run.mjs",
+    "test:parallel": "node parallel.mjs",
+    "test:mutants": "node mutants.mjs"
+  },
   "devDependencies": {
     "playwright-core": "^1.64.1"
   }

@@ -28,10 +28,8 @@
     if (!armed) tell("__no_new_tabs_unlisted__");
   }
 
-  const blocked = (host, domains) => {
-    const h = (host ?? "").toLowerCase().replace(/\.$/, "");
-    return !!h && domains.some((d) => h === d || h.endsWith(`.${d}`));
-  };
+  // match.js runs just before this file, in this same isolated world.
+  const blocked = globalThis.NoNewTabsMatch.isListed;
   const hostOf = (origin) => {
     try { return new URL(origin).hostname; } catch { return ""; }
   };
@@ -63,8 +61,10 @@
 
   chrome.storage.sync.get("domains").then(({ domains = [] }) => check(domains));
   // Sites added while a page is open get guarded without a reload.
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "sync" && changes.domains) check(changes.domains.newValue ?? []);
+  // Only the sync area: the background's frequent session-storage writes
+  // must not wake every frame of every page.
+  chrome.storage.sync.onChanged.addListener((changes) => {
+    if (changes.domains) check(changes.domains.newValue ?? []);
   });
 
   // A context menu the user opens on a guarded page: what they pick from it
@@ -155,67 +155,79 @@
   // is their own only when picked straight from the menu. Every frame
   // reports its own input; the record belongs to the whole tab. The right
   // button itself never closes (it opens the menu instead).
+  function onPointerDown(e) {
+    if (!armed || !e.isTrusted) return;
+    if (e.button === 2) {
+      pressSelection = readSelection();
+      return;
+    }
+    menuOpen = false;
+    send({ type: "contextMenuClosed" });
+  }
+  function onContextMenu(e) {
+    if (!armed || !e.isTrusted) return;
+    menuOpen = true;
+    const srcs = [];
+    const seen = new Set();
+    const take = (n) => {
+      if (!n || seen.has(n)) return;
+      seen.add(n);
+      for (const u of imgSrcs(n)) srcs.push(u);
+    };
+    for (const n of e.composedPath()) take(n);
+    // Nodes inside a closed shadow tree never appear above; walk out
+    // from the element under the pointer instead.
+    for (const n of underPointer(e.clientX, e.clientY)) take(n);
+    // The selection the user had when the button went down. A page that
+    // selects its own text on mousedown (for the menu to offer) finds an
+    // empty record instead. A keyboard-opened menu has no pointer press;
+    // that path is inherently genuine, so it keeps the live selection.
+    const now = readSelection();
+    const selection = pressSelection === null || now === pressSelection ? now : "";
+    pressSelection = null;
+    send({ type: "contextMenu", selection, srcs: srcs.filter(Boolean) });
+  }
+  // A synthetic click the page dispatches itself (to open a tab matching
+  // the record above) voids the record: the background refuses the
+  // exemption for it. Genuine menu picks involve no page activation — the
+  // page gets no events while its menu is open. Every one is reported,
+  // never coalesced: the record belongs to the whole tab, and another
+  // frame (another process) can write a fresh one in the middle of this
+  // frame's task, so a later synthetic click in the same task must void
+  // that one too.
+  function onUntrustedActivation(e) {
+    if (!armed || e.isTrusted) return;
+    send({ type: "untrustedActivation" });
+  }
+  // A key press, a tab switch or a hidden tab in the menu's own frame
+  // means the menu is gone (while it is open, the page gets neither).
+  function onKeyDown(e) {
+    if (!menuOpen || !e.isTrusted) return;
+    menuOpen = false;
+    send({ type: "contextMenuClosed" });
+  }
+  function onMenuGone() {
+    if (!menuOpen) return;
+    menuOpen = false;
+    send({ type: "contextMenuClosed" });
+  }
   // document.open() drops every listener on the window and document,
   // including these: re-run the setup from an observer (observers
-  // survive document.open()). Adding the same listener twice is a
-  // no-op, so re-running is safe on an intact document.
+  // survive document.open()). The browser drops a second add of the same
+  // (type, function, capture), so re-running on an intact document adds
+  // nothing — but only because these are the same function objects every
+  // time. Fresh closures here would pile up, and two contextmenu listeners
+  // would be a hole, not just waste: the first uses up pressSelection and
+  // reports "", the second then sees no press and reports the selection
+  // the page planted on mousedown (issue 6 part A again).
   function listenMenus() {
-    window.addEventListener("pointerdown", (e) => {
-      if (!armed || !e.isTrusted) return;
-      if (e.button === 2) {
-        pressSelection = readSelection();
-        return;
-      }
-      menuOpen = false;
-      send({ type: "contextMenuClosed" });
-    }, true);
-    window.addEventListener("contextmenu", (e) => {
-      if (!armed || !e.isTrusted) return;
-      menuOpen = true;
-      const srcs = [];
-      const seen = new Set();
-      const take = (n) => {
-        if (!n || seen.has(n)) return;
-        seen.add(n);
-        for (const u of imgSrcs(n)) srcs.push(u);
-      };
-      for (const n of e.composedPath()) take(n);
-      // Nodes inside a closed shadow tree never appear above; walk out
-      // from the element under the pointer instead.
-      for (const n of underPointer(e.clientX, e.clientY)) take(n);
-      // The selection the user had when the button went down. A page that
-      // selects its own text on mousedown (for the menu to offer) finds an
-      // empty record instead. A keyboard-opened menu has no pointer press;
-      // that path is inherently genuine, so it keeps the live selection.
-      const now = readSelection();
-      const selection = pressSelection === null || now === pressSelection ? now : "";
-      pressSelection = null;
-      send({ type: "contextMenu", selection, srcs: srcs.filter(Boolean) });
-    }, true);
-    // A synthetic click the page dispatches itself (to open a tab matching
-    // the record above) voids the record: the background refuses the
-    // exemption for it. Genuine menu picks involve no page activation — the
-    // page gets no events while its menu is open.
-    for (const type of ["click", "auxclick"]) {
-      window.addEventListener(type, (e) => {
-        if (!armed || e.isTrusted) return;
-        send({ type: "untrustedActivation" });
-      }, true);
-    }
-    // A key press, a tab switch or a hidden tab in the menu's own frame
-    // means the menu is gone (while it is open, the page gets neither).
-    window.addEventListener("keydown", (e) => {
-      if (!menuOpen || !e.isTrusted) return;
-      menuOpen = false;
-      send({ type: "contextMenuClosed" });
-    }, true);
-    for (const type of ["blur", "visibilitychange"]) {
-      window.addEventListener(type, () => {
-        if (!menuOpen) return;
-        menuOpen = false;
-        send({ type: "contextMenuClosed" });
-      }, true);
-    }
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("contextmenu", onContextMenu, true);
+    window.addEventListener("click", onUntrustedActivation, true);
+    window.addEventListener("auxclick", onUntrustedActivation, true);
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("blur", onMenuGone, true);
+    window.addEventListener("visibilitychange", onMenuGone, true);
   }
   listenMenus();
   new MutationObserver(() => listenMenus()).observe(document, { childList: true });
